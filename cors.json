@@ -1,0 +1,8 @@
+[
+  {
+    "origin": ["http://localhost:5173", "https://solidando-app-ba5a0.web.app", "https://solidando-app-ba5a0.firebaseapp.com"],
+    "method": ["GET", "PUT", "POST", "DELETE", "HEAD"],
+    "responseHeader": ["Content-Type", "Authorization", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]
