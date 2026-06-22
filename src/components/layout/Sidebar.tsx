@@ -6,8 +6,8 @@ import solidandoLogo from '../../assets/solidando.png'
 
 const navItems = [
   { to: '/dashboard', icon: 'dashboard', label: 'Dashboard' },
-  { to: '/forms', icon: 'description', label: 'Forms' },
-  { to: '/events', icon: 'event', label: 'Events' },
+  { to: '/events', icon: 'event', label: 'Eventi' },
+  { to: '/accounting', icon: 'account_balance_wallet', label: 'Contabilità' },
   { to: '/settings', icon: 'settings', label: 'Settings' },
 ]
 

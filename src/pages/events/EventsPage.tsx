@@ -5,7 +5,8 @@ import Icon from '../../components/ui/Icon'
 import Badge from '../../components/ui/Badge'
 import { useAuthStore } from '../../stores/authStore'
 import { getEvents, createEvent, deleteEvent, updateEvent, getEventBookedCount } from '../../firebase/events'
-import type { SolidandoEvent, EventStatus, TicketType } from '../../types/form'
+import { getForms } from '../../firebase/forms'
+import type { SolidandoEvent, EventStatus, TicketType, Form } from '../../types/form'
 import { nanoid } from 'nanoid'
 import ImageGalleryModal from '../../components/ui/ImageGalleryModal'
 
@@ -42,9 +43,10 @@ interface EventModalProps {
   event?: SolidandoEvent
   onClose: () => void
   onSave: (data: Partial<SolidandoEvent>) => Promise<void>
+  forms: Form[]
 }
 
-function EventModal({ event, onClose, onSave }: EventModalProps) {
+function EventModal({ event, onClose, onSave, forms }: EventModalProps) {
   const isEdit = !!event
   const [title, setTitle] = useState(event?.title ?? '')
   const [description, setDescription] = useState(event?.description ?? '')
@@ -57,6 +59,7 @@ function EventModal({ event, onClose, onSave }: EventModalProps) {
   const [imageUrl, setImageUrl] = useState(event?.imageUrl ?? '')
   const [totalCapacity, setTotalCapacity] = useState<string>(event?.totalCapacity?.toString() ?? '')
   const [status, setStatus] = useState<EventStatus>(event?.status ?? 'draft')
+  const [formId, setFormId] = useState(event?.formId ?? '')
   const [ticketTypes, setTicketTypes] = useState<TicketType[]>(
     event?.ticketTypes ?? [{ id: nanoid(6), label: 'Standard', price: 0, currency: 'EUR', capacity: null }]
   )
@@ -91,6 +94,7 @@ function EventModal({ event, onClose, onSave }: EventModalProps) {
       imageUrl: imageUrl || undefined,
       totalCapacity: totalCapacity ? parseInt(totalCapacity) : null,
       status,
+      formId: formId || undefined,
       ticketTypes,
     })
     setSaving(false)
@@ -274,6 +278,24 @@ function EventModal({ event, onClose, onSave }: EventModalProps) {
             </div>
           </div>
 
+          {/* Form iscrizione */}
+          <div>
+            <label className="block text-xs font-bold text-[#444653] uppercase tracking-wider mb-1.5">
+              Form iscrizione
+            </label>
+            <select
+              value={formId}
+              onChange={e => setFormId(e.target.value)}
+              className="w-full px-4 py-2.5 border border-[#c4c5d5] rounded-xl focus:ring-2 focus:ring-[#002068] focus:outline-none text-sm bg-white"
+            >
+              <option value="">— Nessun form collegato —</option>
+              {forms.map(f => (
+                <option key={f.id} value={f.id}>{f.title}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-[#747684]">Il form verrà usato per raccogliere le iscrizioni online e manuali.</p>
+          </div>
+
           {/* Ticket types */}
           <div>
             <div className="flex items-center justify-between mb-2">
@@ -374,6 +396,7 @@ export default function EventsPage() {
   const navigate = useNavigate()
   const { user, profile } = useAuthStore()
   const [events, setEvents] = useState<SolidandoEvent[]>([])
+  const [forms, setForms] = useState<Form[]>([])
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
   const [editingEvent, setEditingEvent] = useState<SolidandoEvent | null>(null)
@@ -383,6 +406,7 @@ export default function EventsPage() {
 
   useEffect(() => {
     if (!workspaceId) return
+    getForms(workspaceId, undefined, true).then(setForms)
     loadEvents().finally(() => setLoading(false))
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, isAdmin])
@@ -392,7 +416,7 @@ export default function EventsPage() {
     const withCounts = await Promise.all(
       evs.map(async (ev) => {
         if (!ev.formId) return ev
-        const count = await getEventBookedCount(ev.formId, ev.attendeeFieldId)
+        const count = await getEventBookedCount(ev.formId, ev.attendeeFieldId, ev.attendeeFieldIds)
         return { ...ev, _bookedCount: count }
       })
     )
@@ -528,6 +552,7 @@ export default function EventsPage() {
         <EventModal
           onClose={() => setShowModal(false)}
           onSave={handleCreate}
+          forms={forms}
         />
       )}
       {editingEvent && (
@@ -535,6 +560,7 @@ export default function EventsPage() {
           event={editingEvent}
           onClose={() => setEditingEvent(null)}
           onSave={handleEdit}
+          forms={forms}
         />
       )}
     </AppLayout>

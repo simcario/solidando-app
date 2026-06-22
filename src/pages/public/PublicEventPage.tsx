@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
+import { Helmet } from 'react-helmet-async'
 import { getEvent, getEventBookedCount } from '../../firebase/events'
 import { useAuthStore } from '../../stores/authStore'
 import Icon from '../../components/ui/Icon'
@@ -42,12 +43,12 @@ export default function PublicEventPage() {
   useEffect(() => {
     if (!eventId || authLoading || !user) return
     getEvent(eventId).then(async ev => {
-      if (!ev || ev.status !== 'published') {
+      if (!ev || ev.status === 'draft') {
         setNotFound(true)
       } else {
         setEvent(ev)
         if (ev.totalCapacity !== null && ev.formId) {
-          const booked = await getEventBookedCount(ev.formId, ev.attendeeFieldId)
+          const booked = await getEventBookedCount(ev.formId, ev.attendeeFieldId, ev.attendeeFieldIds)
           setAvailableSpots(Math.max(0, ev.totalCapacity - booked))
         }
       }
@@ -119,9 +120,31 @@ export default function PublicEventPage() {
   const price = lowestPrice(event)
   const hasEndDate = event.endDate && event.endDate !== event.startDate
   const ctaLabel = event.ctaLabel?.trim() || 'Iscriviti'
+  const isClosed = event.status === 'closed' || event.status === 'cancelled'
+
+  const pageUrl = `${window.location.origin}/e/${eventId}`
+  const ogImage = event.imageUrl || ''
+  const ogDescription = event.description
+    ? event.description.slice(0, 200)
+    : `${formatDate(event.startDate)}${event.location ? ' · ' + event.location : ''}`
 
   return (
     <div className="min-h-screen bg-[#f4f3fc] flex flex-col overflow-x-hidden">
+      <Helmet>
+        <title>{event.title} — Solidando</title>
+        <meta name="description" content={ogDescription} />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={pageUrl} />
+        <meta property="og:title" content={event.title} />
+        <meta property="og:description" content={ogDescription} />
+        {ogImage && <meta property="og:image" content={ogImage} />}
+        <meta property="og:site_name" content="Solidando" />
+        <meta name="twitter:card" content={ogImage ? 'summary_large_image' : 'summary'} />
+        <meta name="twitter:title" content={event.title} />
+        <meta name="twitter:description" content={ogDescription} />
+        {ogImage && <meta name="twitter:image" content={ogImage} />}
+      </Helmet>
+
       {/* Navbar minimal */}
       <header className="bg-white border-b border-[#e8e7f4] py-3 flex justify-center">
         <div className="w-full max-w-2xl px-4 flex items-center">
@@ -251,8 +274,12 @@ export default function PublicEventPage() {
           </div>
         )}
 
-        {/* CTA form */}
-        {event.formId && (
+        {/* CTA form / stato chiuso */}
+        {isClosed ? (
+          <div className="w-full text-center py-4 bg-[#e8e7f0] text-[#747684] font-bold text-base rounded-2xl cursor-not-allowed">
+            {event.status === 'cancelled' ? 'Evento annullato' : 'Iscrizioni chiuse'}
+          </div>
+        ) : event.formId && (
           availableSpots === 0 ? (
             <div className="w-full text-center py-4 bg-[#e8e7f0] text-[#747684] font-bold text-base rounded-2xl cursor-not-allowed">
               Posti esauriti
@@ -268,7 +295,7 @@ export default function PublicEventPage() {
         )}
 
         {/* Chiusura iscrizioni */}
-        {event.closesAt && (
+        {!isClosed && event.closesAt && (
           <p className="text-center text-xs text-[#747684]">
             Le iscrizioni chiudono il{' '}
             {new Date(event.closesAt).toLocaleDateString('it-IT', { day: 'numeric', month: 'long', year: 'numeric' })}

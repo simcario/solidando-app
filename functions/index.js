@@ -144,7 +144,7 @@ async function createNotification({ uid, title, body, threadId, threadType, url 
 
 // ─── Shared: run form actions after a response is created/payment completed ───
 
-async function runFormActions(responseData, formId, skipEmailActions, responseId = '') {
+async function runFormActions(responseData, formId, skipEmailActions, responseId = '', skipSubmitterEmail = false) {
   const { answers } = responseData
 
   const formSnap = await db.doc(`forms/${formId}`).get()
@@ -225,6 +225,7 @@ async function runFormActions(responseData, formId, skipEmailActions, responseId
 
       if (action.type === 'notify_submitter') {
         if (skipEmailActions) { logger.info('notify_submitter: skipped — payment pending'); continue }
+        if (skipSubmitterEmail) { logger.info('notify_submitter: skipped — admin opted out'); continue }
         if (!smtp) { logger.warn('notify_submitter action: no SMTP configured'); continue }
         const { emailFieldId, subject, body } = action.config
         const recipientEmail = answers[emailFieldId]
@@ -280,10 +281,12 @@ async function runFormActions(responseData, formId, skipEmailActions, responseId
     }
   }
 
-  // Conferma compilatore via template workspace (solo se pagamento non pending)
+  // Conferma compilatore via template workspace (solo se pagamento non pending e admin non ha disabilitato)
   if (!hasNotifyAction && emailTemplates.submitterConfirmation) {
     if (skipEmailActions) {
       logger.info('workspace submitterConfirmation: skipped — payment pending')
+    } else if (skipSubmitterEmail) {
+      logger.info('workspace submitterConfirmation: skipped — admin opted out')
     } else {
       const emailNode = (form.nodes ?? []).find(n => n.type === 'email')
       const recipientEmail = emailNode ? answers[emailNode.id] : null
@@ -324,9 +327,13 @@ exports.onFormSubmit = onDocumentCreated({ document: 'responses/{responseId}', d
   const form = formSnap.data()
 
   const hasPaymentNode = (form.nodes ?? []).some(n => n.type === 'payment')
-  const paymentPending = hasPaymentNode && response.paymentStatus !== 'completed'
+  // Per pagamenti "di persona" le email vanno inviate subito (il pagamento è atteso in loco)
+  const isInPerson = response.paymentMethod === 'in_person'
+  // 'none' = gratuito/esentato → non bloccare le email; solo 'pending' le blocca
+  const paymentPending = hasPaymentNode && response.paymentStatus === 'pending' && !isInPerson
+  const skipSubmitterEmail = response.skipSubmitterEmail === true
 
-  await runFormActions(response, formId, paymentPending, event.params.responseId)
+  await runFormActions(response, formId, paymentPending, event.params.responseId, skipSubmitterEmail)
 
   // Notify form owner (in-app + push)
   const ownerId = form.createdBy
@@ -354,6 +361,25 @@ exports.onPaymentCompleted = onDocumentUpdated({ document: 'responses/{responseI
   const { formId } = after
   if (!formId) return
 
+  // Esegui azioni email solo per pagamenti PayPal completati automaticamente.
+  // Per pagamenti manuali (admin, cassa, in_person) le email non devono scattare qui.
+  if (!after.paypalOrderId) {
+    logger.info(`onPaymentCompleted: skipping email actions — no paypalOrderId for responseId=${event.params.responseId}`)
+    // Manda solo notifica in-app, poi esci
+    const formSnapQuick = await db.doc(`forms/${formId}`).get()
+    if (formSnapQuick.exists) {
+      await createNotification({
+        uid: formSnapQuick.data().createdBy,
+        title: `Pagamento ricevuto — ${formSnapQuick.data().title ?? 'Form'}`,
+        body: 'Un partecipante ha completato il pagamento.',
+        threadId: formId,
+        threadType: 'form',
+        url: `/responses/${formId}`,
+      }).catch(() => {})
+    }
+    return
+  }
+
   logger.info(`onPaymentCompleted: responseId=${event.params.responseId} formId=${formId}`)
   await runFormActions(after, formId, false, event.params.responseId)
 
@@ -369,6 +395,85 @@ exports.onPaymentCompleted = onDocumentUpdated({ document: 'responses/{responseI
       threadType: 'form',
       url: `/responses/${formId}`,
     }).catch(err => logger.warn('createNotification failed', err?.message))
+
+    // Invia ricevuta fiscale automatica se configurata
+    try {
+      let workspaceId = form.workspaceId
+      if (!workspaceId || workspaceId === 'default') {
+        const userSnap = await db.doc(`users/${form.createdBy}`).get()
+        const altId = userSnap.exists ? userSnap.data()?.workspaceIds?.[0] : null
+        workspaceId = altId || form.createdBy
+      }
+      const wsSnap = await db.doc(`workspace_settings/${workspaceId}`).get()
+      const ws = wsSnap.exists ? wsSnap.data() : {}
+
+      if (ws.fiscal?.organizationName && ws.fiscal?.fiscalCode && ws.smtp?.host) {
+        // Trova email destinatario dalle risposte
+        const nodes = form.nodes ?? []
+        let recipientEmail = ''
+        for (const node of nodes) {
+          if (node.type === 'email') {
+            const val = (after.answers ?? {})[node.id]
+            if (val && typeof val === 'string') { recipientEmail = val.trim(); break }
+          }
+        }
+
+        if (recipientEmail) {
+          // Genera numero ricevuta
+          const receiptNumber = await getNextReceiptNumber(workspaceId)
+          await db.doc(`responses/${event.params.responseId}`).update({ receiptNumber })
+
+          // Trova nome destinatario
+          let recipientName = ''
+          for (const node of nodes) {
+            if (node.type === 'short_text' || node.type === 'text') {
+              const val = (after.answers ?? {})[node.id]
+              if (val && typeof val === 'string') { recipientName = val.trim(); break }
+            }
+          }
+          if (!recipientName) recipientName = recipientEmail
+
+          let amount = after.paymentAmount ?? 0
+          let currency = 'EUR'
+          const paymentNode = nodes.find(n => n.type === 'payment')
+          if (paymentNode) {
+            currency = paymentNode.properties?.currency ?? 'EUR'
+            if (!amount) amount = paymentNode.properties?.amount ?? 0
+          }
+
+          let eventDate
+          if (after.eventId) {
+            const eventSnap = await db.doc(`events/${after.eventId}`).get()
+            if (eventSnap.exists) eventDate = eventSnap.data().startDate
+          }
+
+          const receipt = {
+            receiptNumber,
+            receiptDate: new Date().toISOString().split('T')[0],
+            recipientName,
+            recipientEmail,
+            amount,
+            currency,
+            eventTitle: form.title ?? 'Iscrizione',
+            eventDate,
+            paymentMethod: 'PayPal',
+            paypalOrderId: after.paypalOrderId,
+          }
+
+          const html = buildReceiptHtml(ws.fiscal, receipt)
+          const transporter = createTransporter(ws.smtp)
+          await transporter.sendMail({
+            from: `"${ws.smtp.fromName || ws.fiscal.organizationName}" <${ws.smtp.fromEmail}>`,
+            to: recipientEmail,
+            subject: `Ricevuta ${receiptNumber} — ${form.title ?? 'Iscrizione'}`,
+            html: `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;padding:24px 0"><p style="color:#444653;margin:0 0 20px">Gentile <strong>${recipientName}</strong>,<br>di seguito trovi la tua ricevuta per il pagamento effettuato.</p>${html}<p style="color:#c4c5d5;font-size:11px;margin:20px 0 0;text-align:center">Powered by Solidando</p></div>`,
+          })
+          logger.info(`onPaymentCompleted: receipt ${receiptNumber} sent to ${recipientEmail}`)
+        }
+      }
+    } catch (err) {
+      logger.warn('Receipt auto-send failed (non-fatal)', err?.message)
+    }
   }
 })
 
@@ -450,7 +555,7 @@ exports.capturePaypalOrder = onCall({ region: 'europe-west1' }, async (request) 
 exports.checkInResponse = onCall({ region: 'europe-west1' }, async (request) => {
   if (!request.auth) throw new HttpsError('unauthenticated', 'Devi essere autenticato')
 
-  const { responseId } = request.data
+  const { responseId, attendeeCount } = request.data
   if (!responseId) throw new HttpsError('invalid-argument', 'responseId obbligatorio')
 
   const ref = db.doc(`responses/${responseId}`)
@@ -462,12 +567,18 @@ exports.checkInResponse = onCall({ region: 'europe-west1' }, async (request) => 
     return { alreadyCheckedIn: true, checkInAt: data.checkInAt?.toDate?.().toISOString() ?? null }
   }
 
-  await ref.update({
+  const updateData = {
     checkInStatus: 'checked_in',
     checkInAt: admin.firestore.FieldValue.serverTimestamp(),
-  })
+  }
+  // Sovrascrive attendeeCount se specificato dall'admin (persone realmente presenti != iscrizione)
+  if (attendeeCount != null && Number.isInteger(attendeeCount) && attendeeCount > 0) {
+    updateData.attendeeCount = attendeeCount
+  }
 
-  logger.info(`checkIn: responseId=${responseId} uid=${request.auth.uid}`)
+  await ref.update(updateData)
+
+  logger.info(`checkIn: responseId=${responseId} uid=${request.auth.uid} attendeeCount=${attendeeCount ?? 'unchanged'}`)
   return { alreadyCheckedIn: false }
 })
 
@@ -529,6 +640,7 @@ exports.getResponseForCheckin = onCall({ region: 'europe-west1' }, async (reques
     checkInAt: data.checkInAt?.toDate?.().toISOString() ?? null,
     answers: data.answers ?? {},
     labels,
+    attendeeCount: data.attendeeCount ?? 1,
   }
 })
 
@@ -733,3 +845,644 @@ exports.sendTestEmail = onCall({ region: 'europe-west1' }, async (request) => {
     throw new HttpsError('internal', `Errore invio: ${err.message}`)
   }
 })
+
+// ─── buildReceiptHtml — genera HTML ricevuta fiscale (plain, no React) ──────
+
+function buildReceiptHtml(fiscal, receipt) {
+  function fmtCurrency(amount, currency) {
+    return new Intl.NumberFormat('it-IT', { style: 'currency', currency }).format(amount)
+  }
+  function fmtDate(iso) {
+    return new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: 'long', year: 'numeric' }).format(new Date(iso))
+  }
+
+  return `
+<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
+  <div style="background:#002068;padding:28px 36px 22px">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td>
+        <p style="color:#8aa4ff;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin:0 0 4px">RICEVUTA</p>
+        <h1 style="color:#ffffff;font-size:20px;font-weight:900;margin:0">${fiscal.organizationName}</h1>
+        ${fiscal.vatNumber ? `<p style="color:#b0c4ff;font-size:11px;margin:4px 0 0;font-family:monospace">P.IVA ${fiscal.vatNumber}</p>` : ''}
+        <p style="color:#b0c4ff;font-size:11px;margin:2px 0 0;font-family:monospace">C.F. ${fiscal.fiscalCode}</p>
+      </td>
+      <td style="text-align:right;vertical-align:top">
+        <p style="color:#fe9832;font-size:15px;font-weight:900;margin:0;font-family:monospace">${receipt.receiptNumber}</p>
+        <p style="color:#b0c4ff;font-size:11px;margin:4px 0 0">${fmtDate(receipt.receiptDate)}</p>
+      </td>
+    </tr></table>
+  </div>
+  <div style="padding:28px 36px;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 12px 12px">
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px"><tr>
+      <td width="50%" style="vertical-align:top;padding-right:12px">
+        <p style="font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.5px;margin:0 0 6px">Emittente</p>
+        <p style="font-weight:700;color:#1a1b22;margin:0 0 2px">${fiscal.organizationName}</p>
+        <p style="color:#444653;margin:0 0 2px">${fiscal.address}</p>
+        <p style="color:#444653;margin:0 0 2px">${fiscal.postalCode} ${fiscal.city} (${fiscal.province})</p>
+        ${fiscal.phone ? `<p style="color:#444653;margin:0 0 2px">Tel. ${fiscal.phone}</p>` : ''}
+        ${fiscal.email ? `<p style="color:#444653;margin:0">${fiscal.email}</p>` : ''}
+      </td>
+      <td width="50%" style="vertical-align:top;padding-left:12px">
+        <p style="font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.5px;margin:0 0 6px">Destinatario</p>
+        <p style="font-weight:700;color:#1a1b22;margin:0 0 2px">${receipt.recipientName}</p>
+        ${receipt.recipientEmail ? `<p style="color:#444653;margin:0">${receipt.recipientEmail}</p>` : ''}
+      </td>
+    </tr></table>
+    <hr style="border:none;border-top:1px solid #e8e7f0;margin:0 0 24px">
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;border-collapse:collapse">
+      <thead>
+        <tr style="background:#f4f3fc">
+          <th style="padding:10px 14px;text-align:left;font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.2px;border-bottom:2px solid #e8e7f0">Descrizione / Causale</th>
+          ${receipt.eventDate ? `<th style="padding:10px 14px;text-align:center;font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.2px;border-bottom:2px solid #e8e7f0">Data evento</th>` : ''}
+          <th style="padding:10px 14px;text-align:right;font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.2px;border-bottom:2px solid #e8e7f0">Importo</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="padding:12px 14px;color:#1a1b22;font-weight:600;border-bottom:1px solid #e8e7f0">${receipt.receiptDescription ?? `Contributo liberale per raccolta fondi occasionale ${receipt.eventTitle}`}</td>
+          ${receipt.eventDate ? `<td style="padding:12px 14px;text-align:center;color:#444653;border-bottom:1px solid #e8e7f0">${fmtDate(receipt.eventDate)}</td>` : ''}
+          <td style="padding:12px 14px;text-align:right;color:#1a1b22;font-weight:700;font-family:monospace;border-bottom:1px solid #e8e7f0">${fmtCurrency(receipt.amount, receipt.currency)}</td>
+        </tr>
+      </tbody>
+      <tfoot>
+        <tr style="background:#002068">
+          <td ${receipt.eventDate ? 'colspan="2"' : ''} style="padding:12px 14px;color:#8aa4ff;font-weight:700;font-size:12px">TOTALE PAGATO</td>
+          <td style="padding:12px 14px;text-align:right;color:#ffffff;font-weight:900;font-size:18px;font-family:monospace">${fmtCurrency(receipt.amount, receipt.currency)}</td>
+        </tr>
+      </tfoot>
+    </table>
+    <table cellpadding="0" cellspacing="0" style="margin-bottom:24px"><tr>
+      <td style="padding:10px 16px;background:#f4f3fc;border-radius:8px;border:1px solid #e8e7f0">
+        <p style="font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.2px;margin:0 0 3px">Metodo di pagamento</p>
+        <p style="font-weight:700;color:#1a1b22;margin:0">${receipt.paymentMethod}</p>
+      </td>
+      ${receipt.paypalOrderId ? `
+      <td width="16"></td>
+      <td style="padding:10px 16px;background:#f4f3fc;border-radius:8px;border:1px solid #e8e7f0">
+        <p style="font-size:10px;font-weight:700;color:#747684;text-transform:uppercase;letter-spacing:1.2px;margin:0 0 3px">ID transazione PayPal</p>
+        <p style="font-weight:600;color:#444653;margin:0;font-family:monospace;font-size:11px">${receipt.paypalOrderId}</p>
+      </td>` : ''}
+    </tr></table>
+    ${fiscal.notes ? `<div style="padding:12px 16px;background:#fffbe6;border-radius:8px;border:1px solid #ffe082;margin-bottom:16px"><p style="font-size:11px;color:#7a5800;margin:0;line-height:1.6">${fiscal.notes}</p></div>` : ''}
+    <div style="border-top:1px solid #e8e7f0;padding-top:16px">
+      <p style="font-size:10px;color:#c4c5d5;margin:0">Ricevuta generata elettronicamente · ${receipt.receiptNumber}</p>
+    </div>
+  </div>
+</div>`
+}
+
+// ─── nextReceiptNumber — genera numero progressivo ricevuta per workspace ─────
+
+async function getNextReceiptNumber(workspaceId) {
+  const counterRef = db.doc(`receipt_counters/${workspaceId}`)
+  let newNumber
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(counterRef)
+    let current = snap.exists ? (snap.data().counter ?? 0) : 0
+
+    // Se il counter è > 0 ma non ci sono ricevute attive (tutte eliminate),
+    // verifica il massimo reale su Firestore per evitare buchi nel contatore.
+    // Non è possibile fare query Firestore dentro una transazione, quindi
+    // questa verifica è fatta fuori (vedi sotto, pre-transazione).
+    newNumber = current + 1
+    tx.set(counterRef, { counter: newNumber, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true })
+  })
+  const year = new Date().getFullYear()
+  return `${String(newNumber).padStart(4, '0')}/${year}`
+}
+
+// Sincronizza il counter con il massimo numero di ricevuta realmente presente
+// su Firestore. Da chiamare quando si sospetta un disallineamento.
+async function syncReceiptCounter(workspaceId) {
+  const year = new Date().getFullYear()
+  const suffix = `/${year}`
+  // Cerca tutte le risposte con ricevuta attiva (non annullata) per questo workspace
+  const responsesSnap = await db.collection('responses')
+    .where('receiptNumber', '!=', null)
+    .get()
+  let maxNum = 0
+  for (const doc of responsesSnap.docs) {
+    const rn = doc.data().receiptNumber
+    if (!rn || doc.data().receiptVoided) continue
+    // Formato: "0042/2026"
+    if (rn.endsWith(suffix)) {
+      const n = parseInt(rn.split('/')[0], 10)
+      if (!isNaN(n) && n > maxNum) maxNum = n
+    }
+  }
+  const counterRef = db.doc(`receipt_counters/${workspaceId}`)
+  await counterRef.set({ counter: maxNum, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true })
+  logger.info(`syncReceiptCounter: counter workspace ${workspaceId} sincronizzato a ${maxNum}`)
+  return maxNum
+}
+
+// ─── sendReceipt — callable: invia/reinvia ricevuta fiscale per una risposta ──
+
+exports.sendReceipt = onCall({ region: 'europe-west1' }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Devi essere autenticato')
+
+  const { responseId, recipientEmail: overrideEmail, sendEmail = true } = request.data
+  if (!responseId) throw new HttpsError('invalid-argument', 'responseId obbligatorio')
+
+  // Carica risposta
+  const responseSnap = await db.doc(`responses/${responseId}`).get()
+  if (!responseSnap.exists) throw new HttpsError('not-found', 'Risposta non trovata')
+  const responseData = responseSnap.data()
+
+  if (responseData.paymentStatus !== 'completed') {
+    throw new HttpsError('failed-precondition', 'Il pagamento non è ancora completato')
+  }
+
+  // Carica form
+  const formSnap = await db.doc(`forms/${responseData.formId}`).get()
+  if (!formSnap.exists) throw new HttpsError('not-found', 'Form non trovato')
+  const form = formSnap.data()
+
+  // Risolve workspaceId (gestisce legacy 'default' come runFormActions)
+  let workspaceId = form.workspaceId || responseData.workspaceId
+  if (!workspaceId || workspaceId === 'default') {
+    const userSnap = await db.doc(`users/${form.createdBy}`).get()
+    const altId = userSnap.exists ? userSnap.data()?.workspaceIds?.[0] : null
+    workspaceId = altId || form.createdBy
+    logger.info(`sendReceipt: legacy workspaceId resolved → ${workspaceId}`)
+  }
+
+  // Carica workspace settings
+  const wsSnap = await db.doc(`workspace_settings/${workspaceId}`).get()
+  if (!wsSnap.exists) throw new HttpsError('not-found', 'Workspace non trovato')
+  const ws = wsSnap.data()
+
+  if (!ws.smtp?.host || !ws.smtp?.user || !ws.smtp?.password) {
+    throw new HttpsError('failed-precondition', 'SMTP non configurato')
+  }
+  if (!ws.fiscal?.organizationName || !ws.fiscal?.fiscalCode || !ws.fiscal?.address) {
+    throw new HttpsError('failed-precondition', 'Dati fiscali non configurati nelle impostazioni')
+  }
+
+  // Determina dati ricevuta
+  const fiscal = ws.fiscal
+
+  // Cerca nome destinatario tra le risposte (primo campo text/email)
+  const nodes = form.nodes ?? []
+  let recipientName = ''
+  let recipientEmailFromAnswers = ''
+  for (const node of nodes) {
+    const val = (responseData.answers ?? {})[node.id]
+    if (!val) continue
+    const t = node.type
+    if (!recipientName && (t === 'short_text' || t === 'text') && typeof val === 'string' && val.trim()) {
+      recipientName = val.trim()
+    }
+    if (!recipientEmailFromAnswers && t === 'email' && typeof val === 'string') {
+      recipientEmailFromAnswers = val.trim()
+    }
+  }
+  if (!recipientName) recipientName = recipientEmailFromAnswers || 'N/D'
+
+  const recipientEmail = overrideEmail || recipientEmailFromAnswers
+  if (sendEmail && !recipientEmail) throw new HttpsError('invalid-argument', 'Nessun indirizzo email destinatario trovato')
+
+  // Recupera o genera numero ricevuta
+  let receiptNumber = responseData.receiptNumber
+  if (!receiptNumber) {
+    receiptNumber = await getNextReceiptNumber(workspaceId)
+    await db.doc(`responses/${responseId}`).update({ receiptNumber })
+  }
+
+  // Importo
+  let amount = responseData.paymentAmount ?? 0
+  let currency = 'EUR'
+  const paymentNode = nodes.find(n => n.type === 'payment')
+  if (paymentNode) {
+    currency = paymentNode.properties?.currency ?? 'EUR'
+    if (!amount) {
+      const formula = paymentNode.properties?.paymentFormula
+      if (formula?.fieldId && formula?.variableId) {
+        const variables = form.variables ?? []
+        const variable = variables.find(v => v.id === formula.variableId)
+        const rawAnswer = (responseData.answers ?? {})[formula.fieldId]
+        const fieldVal = rawAnswer !== undefined ? Number(rawAnswer) : 0
+        const varVal = variable ? variable.value : 0
+        switch (formula.op) {
+          case '*': amount = fieldVal * varVal; break
+          case '+': amount = fieldVal + varVal; break
+          case '-': amount = fieldVal - varVal; break
+          case '/': amount = varVal !== 0 ? fieldVal / varVal : 0; break
+        }
+      } else {
+        amount = paymentNode.properties?.amount ?? 0
+      }
+    }
+  }
+
+  // Data evento e dicitura (se la risposta è associata a un evento)
+  let eventDate
+  let receiptDescription
+  if (responseData.eventId) {
+    const eventSnap = await db.doc(`events/${responseData.eventId}`).get()
+    if (eventSnap.exists) {
+      eventDate = eventSnap.data().startDate
+      receiptDescription = eventSnap.data().receiptDescription || undefined
+    }
+  }
+
+  const paymentMethod = responseData.paymentMethod === 'paypal' ? 'PayPal' : responseData.paymentMethod === 'in_person' ? 'Contanti / Persona' : 'N/D'
+
+  const receipt = {
+    receiptNumber,
+    receiptDate: new Date().toISOString().split('T')[0],
+    recipientName,
+    recipientEmail,
+    amount,
+    currency,
+    eventTitle: form.title ?? 'Iscrizione',
+    receiptDescription,
+    eventDate,
+    paymentMethod,
+    paypalOrderId: responseData.paypalOrderId,
+  }
+
+  if (sendEmail) {
+    const html = buildReceiptHtml(fiscal, receipt)
+    const transporter = createTransporter(ws.smtp)
+    await transporter.sendMail({
+      from: `"${ws.smtp.fromName || fiscal.organizationName}" <${ws.smtp.fromEmail}>`,
+      to: recipientEmail,
+      subject: `Ricevuta ${receiptNumber} — ${form.title ?? 'Iscrizione'}`,
+      html: `
+<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;padding:24px 0">
+  <p style="color:#444653;margin:0 0 20px">Gentile <strong>${recipientName}</strong>,<br>di seguito trovi la tua ricevuta per il pagamento effettuato.</p>
+  ${html}
+  <p style="color:#c4c5d5;font-size:11px;margin:20px 0 0;text-align:center">Powered by Solidando</p>
+</div>`,
+    })
+    logger.info(`sendReceipt: sent ${receiptNumber} to ${recipientEmail} for response ${responseId}`)
+  } else {
+    logger.info(`sendReceipt: generated ${receiptNumber} for response ${responseId} (email skipped)`)
+  }
+
+  return { ok: true, receiptNumber, to: recipientEmail ?? null }
+})
+
+// ─── voidReceipt — callable: annulla una ricevuta fiscale ────────────────────
+
+exports.voidReceipt = onCall({ region: 'europe-west1' }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Devi essere autenticato')
+
+  const { responseId, sendVoidNotice = false } = request.data
+  if (!responseId) throw new HttpsError('invalid-argument', 'responseId obbligatorio')
+
+  const responseSnap = await db.doc(`responses/${responseId}`).get()
+  if (!responseSnap.exists) throw new HttpsError('not-found', 'Risposta non trovata')
+  const responseData = responseSnap.data()
+
+  const receiptNumber = responseData.receiptNumber
+  if (!receiptNumber) throw new HttpsError('failed-precondition', 'Nessuna ricevuta associata a questa risposta')
+
+  // Salva la ricevuta annullata nell'archivio voided_receipts
+  await db.collection('voided_receipts').add({
+    responseId,
+    receiptNumber,
+    formId: responseData.formId,
+    voidedAt: admin.firestore.FieldValue.serverTimestamp(),
+    voidedBy: request.auth.uid,
+    paymentAmount: responseData.paymentAmount ?? 0,
+    paymentMethod: responseData.paymentMethod ?? null,
+  })
+
+  // Rimuove receiptNumber dalla risposta e segna come annullata
+  await db.doc(`responses/${responseId}`).update({
+    receiptNumber: admin.firestore.FieldValue.delete(),
+    receiptVoided: true,
+    receiptVoidedAt: admin.firestore.FieldValue.serverTimestamp(),
+    receiptVoidedNumber: receiptNumber,
+  })
+
+  // Opzionalmente invia email di notifica annullamento al destinatario
+  if (sendVoidNotice) {
+    try {
+      const formSnap = await db.doc(`forms/${responseData.formId}`).get()
+      if (formSnap.exists) {
+        const form = formSnap.data()
+        let workspaceId = form.workspaceId || responseData.workspaceId
+        if (!workspaceId || workspaceId === 'default') {
+          const userSnap = await db.doc(`users/${form.createdBy}`).get()
+          workspaceId = (userSnap.exists ? userSnap.data()?.workspaceIds?.[0] : null) || form.createdBy
+        }
+        const wsSnap = await db.doc(`workspace_settings/${workspaceId}`).get()
+        if (wsSnap.exists) {
+          const ws = wsSnap.data()
+          const nodes = form.nodes ?? []
+          let recipientEmail = ''
+          for (const node of nodes) {
+            const val = (responseData.answers ?? {})[node.id]
+            if (!recipientEmail && node.type === 'email' && typeof val === 'string') {
+              recipientEmail = val.trim()
+            }
+          }
+          if (recipientEmail && ws.smtp?.host && ws.smtp?.user && ws.smtp?.password) {
+            const transporter = createTransporter(ws.smtp)
+            const orgName = ws.fiscal?.organizationName || 'Organizzatore'
+            await transporter.sendMail({
+              from: `"${ws.smtp.fromName || orgName}" <${ws.smtp.fromEmail}>`,
+              to: recipientEmail,
+              subject: `Annullamento ricevuta ${receiptNumber}`,
+              html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
+                <p style="color:#444653">Gentile partecipante,</p>
+                <p style="color:#444653">La ricevuta n. <strong>${receiptNumber}</strong> è stata annullata da ${orgName}.</p>
+                <p style="color:#747684;font-size:12px">Per ulteriori informazioni, contattare l'organizzatore.</p>
+                <p style="color:#c4c5d5;font-size:11px;margin-top:24px">Powered by Solidando</p>
+              </div>`,
+            })
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn('voidReceipt: errore invio notifica annullamento', e)
+    }
+  }
+
+  logger.info(`voidReceipt: annullata ricevuta ${receiptNumber} per response ${responseId}`)
+  return { ok: true, voidedReceiptNumber: receiptNumber }
+})
+
+// ─── updateReceiptMeta — callable: modifica data/note di una ricevuta ─────────
+
+exports.updateReceiptMeta = onCall({ region: 'europe-west1' }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Devi essere autenticato')
+
+  const { responseId, recipientEmail, resend = false } = request.data
+  if (!responseId) throw new HttpsError('invalid-argument', 'responseId obbligatorio')
+
+  const responseSnap = await db.doc(`responses/${responseId}`).get()
+  if (!responseSnap.exists) throw new HttpsError('not-found', 'Risposta non trovata')
+  const responseData = responseSnap.data()
+
+  if (!responseData.receiptNumber) {
+    throw new HttpsError('failed-precondition', 'Nessuna ricevuta associata a questa risposta')
+  }
+
+  // Se richiesto reinvio con email diversa, delega a sendReceipt
+  if (resend && recipientEmail) {
+    // Aggiorna l'email se diversa da quella nelle risposte
+    const formSnap = await db.doc(`forms/${responseData.formId}`).get()
+    if (!formSnap.exists) throw new HttpsError('not-found', 'Form non trovato')
+    const form = formSnap.data()
+
+    let workspaceId = form.workspaceId || responseData.workspaceId
+    if (!workspaceId || workspaceId === 'default') {
+      const userSnap = await db.doc(`users/${form.createdBy}`).get()
+      workspaceId = (userSnap.exists ? userSnap.data()?.workspaceIds?.[0] : null) || form.createdBy
+    }
+    const wsSnap = await db.doc(`workspace_settings/${workspaceId}`).get()
+    if (!wsSnap.exists) throw new HttpsError('not-found', 'Workspace non trovato')
+    const ws = wsSnap.data()
+
+    if (!ws.smtp?.host || !ws.smtp?.user || !ws.smtp?.password) {
+      throw new HttpsError('failed-precondition', 'SMTP non configurato')
+    }
+    if (!ws.fiscal?.organizationName) {
+      throw new HttpsError('failed-precondition', 'Dati fiscali non configurati')
+    }
+
+    const fiscal = ws.fiscal
+    const nodes = form.nodes ?? []
+    let recipientName = ''
+    for (const node of nodes) {
+      const val = (responseData.answers ?? {})[node.id]
+      if (!val) continue
+      if (!recipientName && (node.type === 'short_text' || node.type === 'text') && typeof val === 'string') {
+        recipientName = val.trim()
+      }
+    }
+    if (!recipientName) recipientName = recipientEmail
+
+    let amount = responseData.paymentAmount ?? 0
+    let currency = 'EUR'
+    const paymentNode = nodes.find(n => n.type === 'payment')
+    if (paymentNode) currency = paymentNode.properties?.currency ?? 'EUR'
+
+    let eventDate
+    if (responseData.eventId) {
+      const eventSnap = await db.doc(`events/${responseData.eventId}`).get()
+      if (eventSnap.exists) eventDate = eventSnap.data().startDate
+    }
+
+    const paymentMethod = responseData.paymentMethod === 'paypal' ? 'PayPal' : responseData.paymentMethod === 'in_person' ? 'Contanti / Persona' : 'N/D'
+    const receipt = {
+      receiptNumber: responseData.receiptNumber,
+      receiptDate: new Date().toISOString().split('T')[0],
+      recipientName,
+      recipientEmail,
+      amount,
+      currency,
+      eventTitle: form.title ?? 'Iscrizione',
+      eventDate,
+      paymentMethod,
+      paypalOrderId: responseData.paypalOrderId,
+    }
+
+    const html = buildReceiptHtml(fiscal, receipt)
+    const transporter = createTransporter(ws.smtp)
+    await transporter.sendMail({
+      from: `"${ws.smtp.fromName || fiscal.organizationName}" <${ws.smtp.fromEmail}>`,
+      to: recipientEmail,
+      subject: `Ricevuta ${responseData.receiptNumber} — ${form.title ?? 'Iscrizione'}`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;padding:24px 0">
+  <p style="color:#444653;margin:0 0 20px">Gentile <strong>${recipientName}</strong>,<br>di seguito trovi la tua ricevuta per il pagamento effettuato.</p>
+  ${html}
+  <p style="color:#c4c5d5;font-size:11px;margin:20px 0 0;text-align:center">Powered by Solidando</p>
+</div>`,
+    })
+
+    logger.info(`updateReceiptMeta: reinviata ${responseData.receiptNumber} a ${recipientEmail}`)
+    return { ok: true, receiptNumber: responseData.receiptNumber, to: recipientEmail }
+  }
+
+  return { ok: true }
+})
+
+// ─── deleteReceipt — callable: elimina una ricevuta e ricicla il numero ───────
+
+exports.deleteReceipt = onCall({ region: 'europe-west1' }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Devi essere autenticato')
+
+  const { responseId } = request.data
+  if (!responseId) throw new HttpsError('invalid-argument', 'responseId obbligatorio')
+
+  const responseSnap = await db.doc(`responses/${responseId}`).get()
+  if (!responseSnap.exists) throw new HttpsError('not-found', 'Risposta non trovata')
+  const responseData = responseSnap.data()
+
+  const receiptNumber = responseData.receiptNumber
+  if (!receiptNumber) throw new HttpsError('failed-precondition', 'Nessuna ricevuta associata a questa risposta')
+
+  // Ricava workspaceId per decrementare il counter
+  const formSnap = await db.doc(`forms/${responseData.formId}`).get()
+  let workspaceId = null
+  if (formSnap.exists) {
+    const form = formSnap.data()
+    workspaceId = form.workspaceId || responseData.workspaceId
+    if (!workspaceId || workspaceId === 'default') {
+      const userSnap = await db.doc(`users/${form.createdBy}`).get()
+      workspaceId = (userSnap.exists ? userSnap.data()?.workspaceIds?.[0] : null) || form.createdBy
+    }
+  }
+
+  // Decrementa il counter atomicamente per rendere il numero riutilizzabile
+  if (workspaceId) {
+    const counterRef = db.doc(`receipt_counters/${workspaceId}`)
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(counterRef)
+      if (snap.exists) {
+        const current = snap.data().counter ?? 0
+        if (current > 0) {
+          tx.set(counterRef, { counter: current - 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true })
+        }
+      }
+    })
+  }
+
+  // Rimuove il numero ricevuta dalla risposta (senza traccia)
+  await db.doc(`responses/${responseId}`).update({
+    receiptNumber: admin.firestore.FieldValue.delete(),
+    receiptVoided: admin.firestore.FieldValue.delete(),
+    receiptVoidedAt: admin.firestore.FieldValue.delete(),
+    receiptVoidedNumber: admin.firestore.FieldValue.delete(),
+  })
+
+  logger.info(`deleteReceipt: eliminata ricevuta ${receiptNumber} per response ${responseId}, counter decrementato`)
+  return { ok: true, deletedReceiptNumber: receiptNumber }
+})
+
+// ─── resetReceiptCounter — callable: sincronizza counter con il max reale ────
+
+exports.resetReceiptCounter = onCall({ region: 'europe-west1' }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Devi essere autenticato')
+
+  const { workspaceId } = request.data
+  if (!workspaceId) throw new HttpsError('invalid-argument', 'workspaceId obbligatorio')
+
+  const newCounter = await syncReceiptCounter(workspaceId)
+  return { ok: true, counter: newCounter }
+})
+
+// ─── Social preview renderer (Open Graph meta tags for bots) ──────────────────
+
+const { onRequest } = require('firebase-functions/v2/https')
+
+const BOT_UA = /whatsapp|facebookexternalhit|twitterbot|linkedinbot|slackbot|telegrambot|discordbot|pinterest|googlebot|bingbot/i
+
+const APP_URL = 'https://app.lagioianeldare.it'
+
+function escape(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function buildOgHtml({ title, description, imageUrl, pageUrl, redirectUrl }) {
+  const safeTitle = escape(title)
+  const safeDesc = escape(description)
+  const safeImage = escape(imageUrl)
+  const safePage = escape(pageUrl)
+  const imageTag = safeImage
+    ? `<meta property="og:image" content="${safeImage}" />
+    <meta name="twitter:image" content="${safeImage}" />
+    <meta name="twitter:card" content="summary_large_image" />`
+    : `<meta name="twitter:card" content="summary" />`
+
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <title>${safeTitle} — La Gioia nel Dare</title>
+  <meta name="description" content="${safeDesc}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="${safePage}" />
+  <meta property="og:title" content="${safeTitle}" />
+  <meta property="og:description" content="${safeDesc}" />
+  <meta property="og:site_name" content="La Gioia nel Dare" />
+  ${imageTag}
+  <meta name="twitter:title" content="${safeTitle}" />
+  <meta name="twitter:description" content="${safeDesc}" />
+  <meta http-equiv="refresh" content="0;url=${escape(redirectUrl)}" />
+</head>
+<body>
+  <p><a href="${escape(redirectUrl)}">${safeTitle}</a></p>
+</body>
+</html>`
+}
+
+exports.ogRenderer = onRequest(
+  { region: 'europe-west1', maxInstances: 10 },
+  async (req, res) => {
+    const ua = req.headers['user-agent'] ?? ''
+    const path = req.path // e.g. /e/EVENT_ID or /f/FORM_ID
+
+    // Match /e/:eventId or /f/:formId
+    const eventMatch = path.match(/^\/e\/([^/]+)$/)
+    const formMatch = path.match(/^\/f\/([^/]+)$/)
+
+    if (!eventMatch && !formMatch) {
+      res.status(404).send('Not found')
+      return
+    }
+
+    // For non-bot user agents fetch and serve the SPA index.html directly.
+    // A 302 redirect back to the same path would loop because this rewrite
+    // intercepts /e/** and /f/** before the SPA catch-all rule.
+    if (!BOT_UA.test(ua)) {
+      try {
+        const spaRes = await fetch(`${APP_URL}/index.html`)
+        const html = await spaRes.text()
+        res.set('Content-Type', 'text/html; charset=utf-8')
+        res.set('Cache-Control', 'no-store')
+        res.status(200).send(html)
+      } catch (_) {
+        res.redirect(302, APP_URL)
+      }
+      return
+    }
+
+    try {
+      let title = 'La Gioia nel Dare'
+      let description = ''
+      let imageUrl = ''
+      let pageUrl = `${APP_URL}${path}`
+      const redirectUrl = pageUrl
+
+      if (eventMatch) {
+        const eventId = eventMatch[1]
+        const snap = await db.collection('events').doc(eventId).get()
+        if (snap.exists) {
+          const ev = snap.data()
+          title = ev.title || title
+          description = ev.description
+            ? ev.description.slice(0, 200)
+            : [ev.startDate, ev.location].filter(Boolean).join(' · ')
+          imageUrl = ev.imageUrl || ''
+        }
+      } else {
+        const formId = formMatch[1]
+        const snap = await db.collection('forms').doc(formId).get()
+        if (snap.exists) {
+          const form = snap.data()
+          title = form.title || title
+          description = form.description || form.cover?.subtitle || ''
+          if (form.cover?.backgroundType === 'image') {
+            imageUrl = form.cover?.imageUrl || ''
+          }
+        }
+      }
+
+      res.set('Cache-Control', 'public, max-age=300, s-maxage=300')
+      res.status(200).send(buildOgHtml({ title, description, imageUrl, pageUrl, redirectUrl }))
+    } catch (err) {
+      logger.error('ogRenderer error', err)
+      res.redirect(302, `${APP_URL}${path}`)
+    }
+  }
+)

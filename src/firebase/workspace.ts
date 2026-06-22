@@ -6,7 +6,7 @@ import {
   serverTimestamp,
 } from 'firebase/firestore'
 import { db } from './config'
-import type { SmtpConfig, FormAction, PaypalConfig, WorkspaceEmailTemplates } from '../types/form'
+import type { SmtpConfig, FormAction, PaypalConfig, WorkspaceEmailTemplates, FiscalConfig } from '../types/form'
 
 // ─── Workspace settings ───────────────────────────────────────────────────────
 
@@ -21,6 +21,7 @@ export interface WorkspaceSettings {
   paypal?: PaypalConfig
   branding?: BrandingConfig
   emailTemplates?: WorkspaceEmailTemplates
+  fiscal?: FiscalConfig
   updatedAt?: unknown
 }
 
@@ -69,6 +70,16 @@ export async function saveEmailTemplates(workspaceId: string, emailTemplates: Wo
     await updateDoc(ref, { emailTemplates, updatedAt: serverTimestamp() })
   } else {
     await setDoc(ref, { emailTemplates, updatedAt: serverTimestamp() })
+  }
+}
+
+export async function saveFiscalConfig(workspaceId: string, fiscal: FiscalConfig) {
+  const ref = settingsRef(workspaceId)
+  const snap = await getDoc(ref)
+  if (snap.exists()) {
+    await updateDoc(ref, { fiscal, updatedAt: serverTimestamp() })
+  } else {
+    await setDoc(ref, { fiscal, updatedAt: serverTimestamp() })
   }
 }
 

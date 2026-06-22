@@ -1,45 +1,59 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import AppLayout from '../../components/layout/AppLayout'
 import Icon from '../../components/ui/Icon'
 import Badge from '../../components/ui/Badge'
-import { getForms, createForm, deleteForm, duplicateForm, publishForm } from '../../firebase/forms'
+import { getForms, createForm, deleteForm, duplicateForm, publishForm, getForm } from '../../firebase/forms'
 import { getResponseCountsByUser, getResponseCountsByForms } from '../../firebase/responses'
+import { getEvents, updateEvent } from '../../firebase/events'
 import { useAuthStore } from '../../stores/authStore'
-import type { Form } from '../../types/form'
+import type { Form, SolidandoEvent } from '../../types/form'
 
-function resolveWorkspaceId(profile: ReturnType<typeof useAuthStore.getState>['profile']): string {
-  if (!profile) return 'default'
+function resolveWorkspaceId(profile: ReturnType<typeof useAuthStore.getState>['profile']): string | null {
+  if (!profile) return null
   return profile.workspaceIds?.[0] || profile.uid
 }
 
 export default function FormsListPage() {
   const { user, profile } = useAuthStore()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const workspaceId = resolveWorkspaceId(profile)
   const isAdmin = profile?.role === 'admin'
   const [forms, setForms] = useState<Form[]>([])
+  const [events, setEvents] = useState<SolidandoEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
+  const [managingFormId, setManagingFormId] = useState<string | null>(null)
+
+  // Apri il modal di gestione se presente il query param ?manage=<id>
+  useEffect(() => {
+    const id = searchParams.get('manage')
+    if (id) setManagingFormId(id)
+  }, [searchParams])
 
   useEffect(() => {
-    if (!user) return
-    getForms(workspaceId, isAdmin ? undefined : user.uid, isAdmin).then(async f => {
+    if (!user || !workspaceId) return
+    Promise.all([
+      getForms(workspaceId!, isAdmin ? undefined : user.uid, isAdmin),
+      getEvents(workspaceId!, isAdmin),
+    ]).then(async ([f, evts]) => {
       const counts = isAdmin
         ? await getResponseCountsByForms(f.map(x => x.id))
         : await getResponseCountsByUser(user.uid)
       const withCounts = f.map(form => ({ ...form, _responseCount: counts[form.id] ?? 0 }))
       setForms(withCounts)
+      setEvents(evts)
       setLoading(false)
     })
   }, [user, workspaceId, isAdmin])
 
   async function handleCreate() {
-    if (!user) return
+    if (!user || !workspaceId) return
     setCreating(true)
     try {
-      const id = await createForm(workspaceId, user.uid)
+      const id = await createForm(workspaceId!, user.uid)
       navigate(`/builder/${id}`)
     } finally {
       setCreating(false)
@@ -91,17 +105,36 @@ export default function FormsListPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 md:gap-6">
-          {filtered.map(form => (
+          {filtered.map(form => {
+            const linkedEvent = events.find(e => e.formId === form.id)
+            return (
             <FormRow
               key={form.id}
               form={form}
+              linkedEventTitle={linkedEvent?.title}
               onEdit={() => navigate(`/builder/${form.id}`)}
-              onDelete={async () => { if (confirm('Eliminare?')) { await deleteForm(form.id); setForms(f => f.filter(x => x.id !== form.id)) } }}
+              onDelete={async () => {
+                const msg = linkedEvent
+                  ? `Questo form è collegato all'evento "${linkedEvent.title}".\nEliminando il form verrà rimosso il collegamento dall'evento.\n\nProcedere?`
+                  : 'Eliminare questo form?'
+                if (!confirm(msg)) return
+                if (linkedEvent) {
+                  await updateEvent(linkedEvent.id, { formId: '', attendeeFieldId: '', attendeeFieldIds: [] })
+                  setEvents(prev => prev.map(e => e.id === linkedEvent.id ? { ...e, formId: undefined } : e))
+                }
+                await deleteForm(form.id)
+                setForms(f => f.filter(x => x.id !== form.id))
+              }}
               onDuplicate={async () => {
                 if (!user) return
-                const newId = await duplicateForm(form.id, user.uid)
-                const f = await import('../../firebase/forms').then(m => m.getForm(newId))
-                if (f) setForms(prev => [f, ...prev])
+                try {
+                  const newId = await duplicateForm(form.id, user.uid)
+                  const f = await getForm(newId)
+                  if (f) setForms(prev => [{ ...f, _responseCount: 0 }, ...prev])
+                } catch (err) {
+                  console.error('Duplicate failed:', err)
+                  alert('Errore durante la duplicazione del form.')
+                }
               }}
               onTogglePublish={async () => {
                 await publishForm(form.id, !form.published)
@@ -109,7 +142,8 @@ export default function FormsListPage() {
               }}
               onViewResponses={() => navigate(`/responses/${form.id}`)}
             />
-          ))}
+            )
+          })}
         </div>
       )}
       {/* Mobile FAB */}
@@ -119,12 +153,97 @@ export default function FormsListPage() {
       >
         <Icon name="add" filled size={28} />
       </button>
+
+      {/* Modal gestione form */}
+      {managingFormId && (() => {
+        const form = forms.find(f => f.id === managingFormId)
+        const linkedEvent = form ? events.find(e => e.formId === form.id) : undefined
+        const closeModal = () => {
+          setManagingFormId(null)
+          setSearchParams(prev => { prev.delete('manage'); return prev })
+        }
+        return (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm px-4" onClick={closeModal}>
+            <div
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 space-y-5"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-bold text-[#002068] flex items-center gap-2">
+                  <Icon name="dynamic_form" size={22} />
+                  Gestione Form
+                </h2>
+                <button onClick={closeModal} className="p-1 text-[#747684] hover:text-[#002068] transition-colors rounded-lg">
+                  <Icon name="close" size={22} />
+                </button>
+              </div>
+
+              {!form ? (
+                <p className="text-sm text-[#747684]">Form non trovato.</p>
+              ) : (
+                <>
+                  <div className="p-4 bg-[#f4f3fc] rounded-xl border border-[#dde0e7] space-y-1">
+                    <p className="font-semibold text-[#1a1b22] line-clamp-2">{form.title || 'Untitled Form'}</p>
+                    <p className="text-xs text-[#747684]">{form.nodes?.length ?? 0} domande · {form._responseCount ?? 0} risposte</p>
+                    {linkedEvent && (
+                      <div className="flex items-center gap-1 mt-1">
+                        <Icon name="event" size={13} className="text-[#fe9832]" />
+                        <span className="text-xs text-[#fe9832] font-semibold">Collegato a: {linkedEvent.title}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <Link
+                      to={`/builder/${form.id}`}
+                      className="flex items-center justify-center gap-2 py-2.5 px-4 bg-[#002068] text-white text-sm font-bold rounded-xl hover:bg-[#001550] transition-colors"
+                    >
+                      <Icon name="edit" size={16} />
+                      Modifica
+                    </Link>
+                    <Link
+                      to={`/responses/${form.id}`}
+                      className="flex items-center justify-center gap-2 py-2.5 px-4 bg-white border border-[#c4c5d5] text-[#002068] text-sm font-bold rounded-xl hover:bg-[#f4f3fc] transition-colors"
+                    >
+                      <Icon name="inbox" size={16} />
+                      Risposte
+                    </Link>
+                  </div>
+
+                  <hr className="border-[#e8e7f0]" />
+
+                  <button
+                    onClick={async () => {
+                      const msg = linkedEvent
+                        ? `Questo form è collegato all'evento "${linkedEvent.title}".\nEliminando il form verrà rimosso il collegamento dall'evento.\n\nProcedere con l'eliminazione?`
+                        : `Eliminare il form "${form.title || 'Untitled Form'}"? L'operazione non è reversibile.`
+                      if (!confirm(msg)) return
+                      if (linkedEvent) {
+                        await updateEvent(linkedEvent.id, { formId: '', attendeeFieldId: '', attendeeFieldIds: [] })
+                        setEvents(prev => prev.map(e => e.id === linkedEvent.id ? { ...e, formId: undefined } : e))
+                      }
+                      await deleteForm(form.id)
+                      setForms(f => f.filter(x => x.id !== form.id))
+                      closeModal()
+                    }}
+                    className="flex items-center justify-center gap-2 w-full py-2.5 px-4 bg-[#ffdad6] text-[#ba1a1a] text-sm font-bold rounded-xl hover:bg-[#ffb4ab] transition-colors"
+                  >
+                    <Icon name="delete" size={16} />
+                    Elimina form{linkedEvent ? ' e scollega dall\'evento' : ''}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        )
+      })()}
     </AppLayout>
   )
 }
 
-function FormRow({ form, onEdit, onDelete, onDuplicate, onTogglePublish, onViewResponses }: {
+function FormRow({ form, linkedEventTitle, onEdit, onDelete, onDuplicate, onTogglePublish, onViewResponses }: {
   form: Form
+  linkedEventTitle?: string
   onEdit: () => void
   onDelete: () => void
   onDuplicate: () => void
@@ -181,6 +300,14 @@ function FormRow({ form, onEdit, onDelete, onDuplicate, onTogglePublish, onViewR
         <h4 onClick={onEdit} className="font-bold text-[#1a1b22] cursor-pointer hover:text-[#002068] transition-colors line-clamp-1 mb-1">
           {form.title || 'Untitled Form'}
         </h4>
+        {linkedEventTitle && (
+          <div className="flex items-center gap-1 mb-1">
+            <Icon name="event" size={12} className="text-[#fe9832]" />
+            <span className="text-xs text-[#fe9832] font-semibold line-clamp-1" title={`Collegato all'evento: ${linkedEventTitle}`}>
+              {linkedEventTitle}
+            </span>
+          </div>
+        )}
         <p className="text-xs text-[#444653]">
           {form.nodes?.length ?? 0} domande ·{' '}
           {form.updatedAt?.toDate

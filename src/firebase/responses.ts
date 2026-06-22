@@ -66,10 +66,16 @@ export async function submitResponse(
   paymentAmount?: number | null,
   eventId?: string | null,
   attendeeFieldId?: string | null,
+  paymentMethod?: 'paypal' | 'in_person' | null,
+  attendeeFieldIds?: string[] | null,
+  skipSubmitterEmail?: boolean,
 ): Promise<string> {
   const uid = auth.currentUser?.uid ?? null
-  const attendeeCount = attendeeFieldId
-    ? Math.max(1, Number(answers[attendeeFieldId] ?? 1) || 1)
+  const activeIds = (attendeeFieldIds && attendeeFieldIds.length > 0)
+    ? attendeeFieldIds
+    : attendeeFieldId ? [attendeeFieldId] : []
+  const attendeeCount = activeIds.length > 0
+    ? Math.max(1, activeIds.reduce((s, fid) => s + (Number(answers[fid] ?? 0) || 0), 0))
     : 1
   const ref = await addDoc(collection(db, 'responses'), {
     formId,
@@ -82,10 +88,12 @@ export async function submitResponse(
     score: 0,
     paymentStatus,
     ...(paymentAmount != null ? { paymentAmount } : {}),
+    ...(paymentMethod ? { paymentMethod } : {}),
     checkInStatus: 'not_checked_in',
     userId: uid,
     ...(eventId ? { eventId } : {}),
     attendeeCount,
+    ...(skipSubmitterEmail ? { skipSubmitterEmail: true } : {}),
   })
   return ref.id
 }
@@ -94,10 +102,12 @@ export async function updateResponsePaymentStatus(
   responseId: string,
   status: 'completed' | 'failed',
   paypalOrderId?: string,
+  adminMarkPaid = false,
 ) {
   await updateDoc(doc(db, 'responses', responseId), {
     paymentStatus: status,
     ...(paypalOrderId ? { paypalOrderId } : {}),
+    ...(adminMarkPaid ? { adminMarkPaid: true } : {}),
   })
 }
 
@@ -130,4 +140,37 @@ export async function getResponses(formId: string): Promise<Response[]> {
 
 export async function deleteResponse(responseId: string) {
   await deleteDoc(doc(db, 'responses', responseId))
+}
+
+export async function resetCheckIn(responseId: string) {
+  await updateDoc(doc(db, 'responses', responseId), {
+    checkInStatus: 'not_checked_in',
+    checkInAt: null,
+  })
+}
+
+export async function resetPaymentStatus(responseId: string) {
+  await updateDoc(doc(db, 'responses', responseId), {
+    paymentStatus: 'pending',
+  })
+}
+
+export async function clearReceiptNumber(responseId: string) {
+  const { deleteField } = await import('firebase/firestore')
+  await updateDoc(doc(db, 'responses', responseId), {
+    receiptNumber: deleteField(),
+  })
+}
+
+export async function updateResponseAnswers(
+  responseId: string,
+  answers: Record<string, unknown>,
+  attendeeCount?: number,
+  extra?: Record<string, unknown>,
+) {
+  await updateDoc(doc(db, 'responses', responseId), {
+    answers,
+    ...(attendeeCount != null ? { attendeeCount } : {}),
+    ...(extra ?? {}),
+  })
 }

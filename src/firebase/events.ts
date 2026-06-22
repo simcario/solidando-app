@@ -71,21 +71,44 @@ export async function getEventByFormId(formId: string): Promise<SolidandoEvent |
   return { id: d.id, ...d.data() } as SolidandoEvent
 }
 
-export async function getEventBookedCount(formId: string, attendeeFieldId?: string): Promise<number> {
-  const q = query(collection(db, 'responses'), where('formId', '==', formId))
-  const snap = await getDocs(q)
-  if (!attendeeFieldId) return snap.size
-  return snap.docs.reduce((sum, d) => {
-    const val = Number((d.data().answers as Record<string, unknown>)?.[attendeeFieldId] ?? 1)
-    return sum + (isNaN(val) || val < 1 ? 1 : val)
+function sumAttendeeFields(answers: Record<string, unknown>, fieldIds: string[]): number {
+  return fieldIds.reduce((sum, fid) => {
+    const val = Number(answers[fid] ?? 0)
+    return sum + (isNaN(val) || val < 1 ? 0 : val)
   }, 0)
 }
 
-export function countAttendees(responses: Response[], attendeeFieldId?: string): number {
-  if (!attendeeFieldId) return responses.length
+export async function getEventBookedCount(
+  formId: string,
+  attendeeFieldId?: string,
+  attendeeFieldIds?: string[],
+): Promise<number> {
+  const q = query(collection(db, 'responses'), where('formId', '==', formId))
+  const snap = await getDocs(q)
+  const fieldIds = attendeeFieldIds && attendeeFieldIds.length > 0
+    ? attendeeFieldIds
+    : attendeeFieldId ? [attendeeFieldId] : []
+  if (fieldIds.length === 0) return snap.size
+  return snap.docs.reduce((sum, d) => {
+    const answers = (d.data().answers ?? {}) as Record<string, unknown>
+    const val = sumAttendeeFields(answers, fieldIds)
+    return sum + (val < 1 ? 1 : val)
+  }, 0)
+}
+
+export function countAttendees(
+  responses: Response[],
+  attendeeFieldId?: string,
+  attendeeFieldIds?: string[],
+): number {
+  const fieldIds = attendeeFieldIds && attendeeFieldIds.length > 0
+    ? attendeeFieldIds
+    : attendeeFieldId ? [attendeeFieldId] : []
+  if (fieldIds.length === 0) return responses.length
   return responses.reduce((sum, r) => {
-    const val = Number((r.answers as Record<string, unknown>)?.[attendeeFieldId] ?? 1)
-    return sum + (isNaN(val) || val < 1 ? 1 : val)
+    const answers = (r.answers ?? {}) as Record<string, unknown>
+    const val = sumAttendeeFields(answers, fieldIds)
+    return sum + (val < 1 ? 1 : val)
   }, 0)
 }
 

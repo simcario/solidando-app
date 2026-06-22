@@ -80,9 +80,10 @@ export async function deleteForm(formId: string) {
 export async function duplicateForm(formId: string, userId: string): Promise<string> {
   const original = await getForm(formId)
   if (!original) throw new Error('Form not found')
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { id: _id, _responseCount: _rc, ...rest } = original as Form & { _responseCount?: number }
   const ref = await addDoc(collection(db, 'forms'), {
-    ...original,
-    id: undefined,
+    ...rest,
     title: `${original.title} (copia)`,
     published: false,
     slug: nanoid(10),

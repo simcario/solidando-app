@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
+import { Helmet } from 'react-helmet-async'
 import { PayPalScriptProvider, PayPalButtons } from '@paypal/react-paypal-js'
 import { httpsCallable } from 'firebase/functions'
 import { getForm } from '../../firebase/forms'
@@ -14,6 +15,16 @@ import type { Form, FormNode, FormVariable, SolidandoEvent } from '../../types/f
 
 // ─── Formula resolver ─────────────────────────────────────────────────────────
 
+function applyOp(a: number, op: '*' | '+' | '-' | '/', b: number): number {
+  switch (op) {
+    case '*': return a * b
+    case '+': return a + b
+    case '-': return a - b
+    case '/': return b !== 0 ? a / b : 0
+    default: return 0
+  }
+}
+
 function resolvePaymentAmount(
   node: FormNode,
   variables: FormVariable[],
@@ -21,24 +32,31 @@ function resolvePaymentAmount(
   answers: Record<string, unknown>,
 ): number | null {
   const formula = node.properties.paymentFormula
-  if (!formula || !formula.fieldId || !formula.variableId) {
-    return node.properties.amount ?? null
+  if (!formula) return node.properties.amount ?? null
+
+  // new multi-term format
+  if ('terms' in formula) {
+    if (!formula.terms || formula.terms.length === 0) return node.properties.amount ?? null
+    const termResults = formula.terms.map(term => {
+      if (!term.fieldId || !term.variableId) return null
+      const variable = variables.find(v => v.id === term.variableId)
+      if (!variable) return null
+      const rawAnswer = answers[term.fieldId]
+      const fieldVal = rawAnswer !== undefined && rawAnswer !== '' ? Number(rawAnswer) : 0
+      return applyOp(fieldVal, term.op, variable.value)
+    })
+    if (termResults.some(r => r === null)) return node.properties.amount ?? null
+    return (termResults as number[]).reduce((acc, val) => applyOp(acc, formula.combineOp, val), 0)
   }
+
+  // legacy single-term format
+  if (!formula.fieldId || !formula.variableId) return node.properties.amount ?? null
   const srcNode = nodes.find(n => n.id === formula.fieldId)
   const variable = variables.find(v => v.id === formula.variableId)
   if (!srcNode || !variable) return node.properties.amount ?? null
-
   const rawAnswer = answers[formula.fieldId]
   const fieldVal = rawAnswer !== undefined && rawAnswer !== '' ? Number(rawAnswer) : 0
-  const varVal = variable.value
-
-  switch (formula.op) {
-    case '*': return fieldVal * varVal
-    case '+': return fieldVal + varVal
-    case '-': return fieldVal - varVal
-    case '/': return varVal !== 0 ? fieldVal / varVal : 0
-    default: return null
-  }
+  return applyOp(fieldVal, formula.op, variable.value)
 }
 
 // ─── Required field check ─────────────────────────────────────────────────────
@@ -117,7 +135,7 @@ export default function FormPreviewPage() {
       if (ev) {
         setLinkedEvent(ev)
         if (ev.totalCapacity !== null) {
-          const booked = await getEventBookedCount(formId, ev.attendeeFieldId)
+          const booked = await getEventBookedCount(formId, ev.attendeeFieldId, ev.attendeeFieldIds)
           if (booked >= ev.totalCapacity) setCapacityFull(true)
         }
       }
@@ -268,10 +286,13 @@ export default function FormPreviewPage() {
     try {
       // Controllo capienza in tempo reale prima di salvare
       if (linkedEvent?.totalCapacity !== null && linkedEvent?.totalCapacity !== undefined) {
-        const requestedSpots = linkedEvent.attendeeFieldId
-          ? Math.max(1, Number(ans[linkedEvent.attendeeFieldId] ?? 1) || 1)
+        const activeIds = (linkedEvent.attendeeFieldIds && linkedEvent.attendeeFieldIds.length > 0)
+          ? linkedEvent.attendeeFieldIds
+          : linkedEvent.attendeeFieldId ? [linkedEvent.attendeeFieldId] : []
+        const requestedSpots = activeIds.length > 0
+          ? Math.max(1, activeIds.reduce((s, fid) => s + (Number(ans[fid] ?? 0) || 0), 0))
           : 1
-        const booked = await getEventBookedCount(formId, linkedEvent.attendeeFieldId)
+        const booked = await getEventBookedCount(formId, linkedEvent.attendeeFieldId, linkedEvent.attendeeFieldIds)
         if (booked + requestedSpots > linkedEvent.totalCapacity) {
           setCapacityFull(true)
           return
@@ -281,6 +302,10 @@ export default function FormPreviewPage() {
       const paymentNode = form?.nodes?.find(n => n.type === 'payment') ?? null
       const hasPaymentNode = paymentNode !== null
       const paypalPaid = Object.values(ans).includes('paypal')
+      const inPersonPaid = Object.values(ans).includes('in_person')
+      const paymentMethod: 'paypal' | 'in_person' | null = hasPaymentNode
+        ? (paypalPaid ? 'paypal' : inPersonPaid ? 'in_person' : null)
+        : null
       const initialStatus = hasPaymentNode
         ? (paypalPaid ? 'completed' : 'pending')
         : 'none'
@@ -293,6 +318,8 @@ export default function FormPreviewPage() {
         paymentAmount,
         linkedEvent?.id ?? null,
         linkedEvent?.attendeeFieldId ?? null,
+        paymentMethod,
+        linkedEvent?.attendeeFieldIds ?? null,
       )
       setResponseId(newResponseId)
 
@@ -387,10 +414,28 @@ export default function FormPreviewPage() {
   }
 
   // ── Classic mode ─────────────────────────────────────────────────────────────
+  const formOgImage = form.cover?.backgroundType === 'image' ? (form.cover.imageUrl ?? '') : ''
+  const formOgDescription = form.description || form.cover?.subtitle || ''
+  const formPageUrl = `${window.location.origin}/f/${formId}`
+
   if (formMode === 'classic') {
     const endScreenNode = nodes.find(n => n.type === 'end_screen')
     return (
       <div className="min-h-screen flex flex-col items-center" style={{ backgroundColor: '#faf8ff', ...resolveBgStyle(form?.theme?.background ?? '') }}>
+        <Helmet>
+          <title>{form.title} — Solidando</title>
+          <meta name="description" content={formOgDescription} />
+          <meta property="og:type" content="website" />
+          <meta property="og:url" content={formPageUrl} />
+          <meta property="og:title" content={form.title} />
+          <meta property="og:description" content={formOgDescription} />
+          {formOgImage && <meta property="og:image" content={formOgImage} />}
+          <meta property="og:site_name" content="Solidando" />
+          <meta name="twitter:card" content={formOgImage ? 'summary_large_image' : 'summary'} />
+          <meta name="twitter:title" content={form.title} />
+          <meta name="twitter:description" content={formOgDescription} />
+          {formOgImage && <meta name="twitter:image" content={formOgImage} />}
+        </Helmet>
         <div className="w-full max-w-2xl flex flex-col flex-1 md:shadow-xl md:shadow-black/10">
         <header
           className="sticky top-0 z-40 bg-white border-b border-[#c4c5d5] px-6 flex justify-between items-center"
@@ -527,6 +572,20 @@ export default function FormPreviewPage() {
 
   return (
     <div className="min-h-screen flex flex-col items-center" style={{ backgroundColor: '#faf8ff', ...resolveBgStyle(formBg) }}>
+      <Helmet>
+        <title>{form.title} — Solidando</title>
+        <meta name="description" content={formOgDescription} />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={formPageUrl} />
+        <meta property="og:title" content={form.title} />
+        <meta property="og:description" content={formOgDescription} />
+        {formOgImage && <meta property="og:image" content={formOgImage} />}
+        <meta property="og:site_name" content="Solidando" />
+        <meta name="twitter:card" content={formOgImage ? 'summary_large_image' : 'summary'} />
+        <meta name="twitter:title" content={form.title} />
+        <meta name="twitter:description" content={formOgDescription} />
+        {formOgImage && <meta name="twitter:image" content={formOgImage} />}
+      </Helmet>
       <div className="w-full max-w-2xl flex flex-col flex-1 md:shadow-xl md:shadow-black/10">
       {/* Header */}
       <header
@@ -1097,17 +1156,23 @@ function PaymentField({ node, onComplete, onPaypalOrderId, variables, nodes, ans
   return (
     <div className="space-y-4">
       {/* Amount display */}
-      {formattedNet && (
-        <div className="p-5 bg-[#dce1ff] rounded-2xl text-center">
-          <p className="text-sm text-[#444653] font-medium mb-1">Importo da pagare</p>
-          <p className="text-4xl font-black text-[#002068]">{formattedNet}</p>
-          {grossAmount !== null && amount !== null && grossAmount !== amount && (
-            <p className="text-xs text-[#747684] mt-2">
-              Con PayPal: {formattedGross} (include commissioni 3.49% + €0.35)
-            </p>
-          )}
-        </div>
-      )}
+      <div className={`p-5 rounded-2xl text-center ${formattedNet ? 'bg-[#002068]' : 'bg-[#f4f3fc] border border-[#c4c5d5]'}`}>
+        <p className={`text-xs font-bold uppercase tracking-widest mb-2 ${formattedNet ? 'text-[#8aa4ff]' : 'text-[#747684]'}`}>
+          Importo da pagare
+        </p>
+        {formattedNet ? (
+          <>
+            <p className="text-5xl font-black text-white">{formattedNet}</p>
+            {grossAmount !== null && amount !== null && grossAmount !== amount && (
+              <p className="text-xs text-[#8aa4ff] mt-2">
+                Con PayPal: {formattedGross} (commissioni 3.49% + €0.35)
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="text-lg font-bold text-[#747684]">— importo non disponibile —</p>
+        )}
+      </div>
 
       <p className="text-sm font-semibold text-[#747684] uppercase tracking-wider">Scegli come pagare</p>
 

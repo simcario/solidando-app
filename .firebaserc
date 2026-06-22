@@ -1,0 +1,18 @@
+{
+  "projects": {
+    "default": "solidando-app-ba5a0"
+  },
+  "targets": {
+    "solidando-app-ba5a0": {
+      "hosting": {
+        "app": [
+          "solidando-app-ba5a0"
+        ],
+        "website": [
+          "solidando"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

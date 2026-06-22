@@ -19,7 +19,9 @@ import PublicEventPage from './pages/public/PublicEventPage'
 import MyPortalPage from './pages/my/MyPortalPage'
 import UsersPage from './pages/users/UsersPage'
 import CheckInPage from './pages/admin/CheckInPage'
+import AdminNewRegistrationPage from './pages/admin/AdminNewRegistrationPage'
 import PublicTicketPage from './pages/public/PublicTicketPage'
+import AccountingPage from './pages/accounting/AccountingPage'
 
 function AppWithAuth() {
   useAuthListener()
@@ -52,6 +54,8 @@ function AppWithAuth() {
       <Route path="/responses/:formId" element={<ProtectedRoute><ResponsesPage /></ProtectedRoute>} />
       <Route path="/events" element={<ProtectedRoute><EventsPage /></ProtectedRoute>} />
       <Route path="/events/:eventId" element={<ProtectedRoute><EventDetailPage /></ProtectedRoute>} />
+      <Route path="/events/:eventId/new-registration" element={<ProtectedRoute><AdminNewRegistrationPage /></ProtectedRoute>} />
+      <Route path="/accounting" element={<ProtectedRoute><AccountingPage /></ProtectedRoute>} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       <Route path="/users" element={<ProtectedRoute><UsersPage /></ProtectedRoute>} />
       <Route path="/admin/checkin" element={<ProtectedRoute><CheckInPage /></ProtectedRoute>} />

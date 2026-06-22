@@ -21,7 +21,7 @@ interface Props {
 }
 
 export default function BlockCard({ node, isSelected, onClick }: Props) {
-  const { removeNode, variables, nodes } = useBuilderStore()
+  const { removeNode, duplicateNode, variables, nodes } = useBuilderStore()
   const label = resolveTemplate(node.properties.label, variables, nodes)
   const helpText = node.properties.helpText
     ? resolveTemplate(node.properties.helpText, variables, nodes)
@@ -77,8 +77,9 @@ export default function BlockCard({ node, isSelected, onClick }: Props) {
                 <Icon name="delete" size={16} />
               </button>
               <button
-                onClick={e => e.stopPropagation()}
+                onClick={e => { e.stopPropagation(); duplicateNode(node.id) }}
                 className="p-1.5 text-[#444653] hover:bg-[#e8e7f0] rounded transition-colors"
+                title="Duplica campo"
               >
                 <Icon name="content_copy" size={16} />
               </button>
@@ -213,11 +214,13 @@ function FieldPreview({ node }: { node: FormNode }) {
   if (type === 'payment') {
     const currency = properties.currency ?? 'EUR'
     const amount = properties.amount
-    const hasFormula = !!properties.paymentFormula
+    const formula = properties.paymentFormula
+    const termCount = formula ? ('terms' in formula ? formula.terms.length : 1) : 0
+    const hasFormula = termCount > 0
     const payInPerson = !!properties.payInPersonEnabled
 
     const amountLabel = hasFormula
-      ? 'Importo calcolato'
+      ? termCount > 1 ? `Formula (${termCount} termini)` : 'Importo calcolato'
       : amount
         ? new Intl.NumberFormat('it-IT', { style: 'currency', currency }).format(amount)
         : 'Importo non impostato'

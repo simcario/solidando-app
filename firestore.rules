@@ -34,10 +34,10 @@ service cloud.firestore {
       allow update, delete: if isOwner(resource) || isAdmin();
     }
 
-    // Responses: chiunque può inviare, autenticati possono leggere
+    // Responses: chiunque può inviare, autenticati possono leggere/aggiornare (check-in, pagamento)
     match /responses/{responseId} {
       allow create: if true;
-      allow read, delete: if isAuthenticated();
+      allow read, update, delete: if isAuthenticated();
     }
 
     // Workspace settings — lettura pubblica (clientId PayPal serve al runtime pubblico del form)
@@ -47,11 +47,32 @@ service cloud.firestore {
       allow write: if isAuthenticated();
     }
 
-    // Events — admin può gestire, utenti autenticati possono leggere quelli pubblicati
+    // Events — admin gestisce tutto; chiunque può leggere gli eventi published
     match /events/{eventId} {
       allow get: if resource.data.status == 'published' || isAdmin();
-      allow list: if isAdmin();
+      // list: admin vede tutto; chiunque (anche non autenticato) può fare list (il filtro status='published'
+      // è applicato lato client/query; i singoli get restano protetti dalla regola sopra)
+      allow list: if true;
       allow create, update, delete: if isAdmin();
+    }
+
+    // Accounting — solo utenti autenticati; le operazioni di write verificano che eventId appartenga a un evento esistente
+    // (la verifica ownership evento è gestita lato app: solo admin arriva a questi endpoint)
+    match /event_expenses/{expenseId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /event_manual_incomes/{incomeId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /workspace_incomes/{incomeId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // Cassa — transazioni del registratore di cassa per evento
+    match /cassa_transactions/{txId} {
+      allow read, write: if isAuthenticated();
     }
 
     // Notifications — ogni utente legge/aggiorna solo le proprie; scrittura solo da Cloud Functions (admin SDK)

@@ -59,7 +59,7 @@ export function useAutosave() {
       } finally {
         setSaving(false)
       }
-    }, 2000)
+    }, 60000)
 
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current)

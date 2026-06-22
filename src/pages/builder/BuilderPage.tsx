@@ -30,10 +30,10 @@ export default function BuilderPage() {
   const { formId } = useParams<{ formId: string }>()
   const navigate = useNavigate()
   const {
-    title, setFormId, setTitle, setDescription, setNodes, setEdges,
-    setCover, setFormBackground, setFormMode, setFieldStyle, setShowCover, setVariables, setActions,
+    title, setFormId, setTitle,
     nodes, selectedNodeId, selectNode, reorderNodes,
     addNode, isDirty, isSaving, formBackground,
+    undo, redo, canUndo, canRedo,
   } = useBuilderStore()
 
   const [loading, setLoading] = useState(true)
@@ -53,17 +53,27 @@ export default function BuilderPage() {
     setFormId(formId)
     getForm(formId).then(form => {
       if (!form) { navigate('/forms'); return }
-      setTitle(form.title)
-      setDescription(form.description)
-      setNodes(form.nodes)
-      setEdges(form.edges)
-      if (form.cover) setCover(form.cover)
-      if (form.showCover !== undefined) setShowCover(form.showCover)
-      if (form.theme?.background) setFormBackground(form.theme.background)
-      if (form.theme?.fieldStyle) setFieldStyle(form.theme.fieldStyle)
-      if (form.settings?.mode) setFormMode(form.settings.mode === 'classic' ? 'classic' : 'conversational')
-      if (form.variables) setVariables(form.variables)
-      if (form.actions) setActions(form.actions)
+      // Carica senza history: setNodes/setEdges/setTitle usati qui non devono creare snapshot
+      const store = useBuilderStore.getState()
+      store.setNodes(form.nodes)
+      store.setEdges(form.edges)
+      // Imposta le altre proprietà direttamente per non inquinare la history
+      useBuilderStore.setState({
+        title: form.title,
+        description: form.description,
+        cover: form.cover ? { ...useBuilderStore.getState().cover, ...form.cover } : useBuilderStore.getState().cover,
+        showCover: form.showCover ?? false,
+        formBackground: form.theme?.background ?? '',
+        fieldStyle: (form.theme?.fieldStyle ?? 'underline') as import('../../types/form').FieldStyle,
+        formMode: form.settings?.mode === 'classic' ? 'classic' : 'conversational',
+        variables: form.variables ?? [],
+        actions: form.actions ?? [],
+        isDirty: false,
+        _past: [],
+        _future: [],
+        canUndo: false,
+        canRedo: false,
+      })
       setLoading(false)
     })
     return () => useBuilderStore.getState().reset()
@@ -77,6 +87,25 @@ export default function BuilderPage() {
       reorderNodes(arrayMove(nodes, oldIndex, newIndex))
     }
   }
+
+  // Scorciatoie Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z)
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const tag = (e.target as HTMLElement)?.tagName
+      // Non intercettare dentro input/textarea/contenteditable
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        useBuilderStore.getState().undo()
+      }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault()
+        useBuilderStore.getState().redo()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
 
   async function handlePublish() {
     const { publishForm } = await import('../../firebase/forms')
@@ -148,6 +177,26 @@ export default function BuilderPage() {
               }`}
             >
               <Icon name="account_tree" size={18} /> Logica
+            </button>
+          </div>
+
+          {/* Undo / Redo */}
+          <div className="flex items-center gap-1 border border-[#c4c5d5] rounded-lg overflow-hidden">
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              title="Annulla (Ctrl+Z)"
+              className="flex items-center px-3 py-2 text-[#444653] hover:bg-[#e8e7f0] transition-all disabled:opacity-30 disabled:cursor-not-allowed border-r border-[#c4c5d5]"
+            >
+              <Icon name="undo" size={18} />
+            </button>
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              title="Ripeti (Ctrl+Y)"
+              className="flex items-center px-3 py-2 text-[#444653] hover:bg-[#e8e7f0] transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <Icon name="redo" size={18} />
             </button>
           </div>
 

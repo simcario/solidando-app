@@ -20,6 +20,17 @@ export interface FormulaConfig {
   variableId: string    // id della FormVariable
 }
 
+export interface PaymentFormulaTerm {
+  fieldId: string
+  op: FormulaOp
+  variableId: string
+}
+
+export interface PaymentFormulaConfig {
+  terms: PaymentFormulaTerm[]
+  combineOp: '+' | '-'  // come sommare i termini tra loro
+}
+
 export interface FormNode {
   id: string
   type: FieldType
@@ -42,7 +53,7 @@ export interface FormNode {
     readOnly?: boolean
     formula?: FormulaConfig
     paypalClientId?: string
-    paymentFormula?: FormulaConfig
+    paymentFormula?: FormulaConfig | PaymentFormulaConfig
     payInPersonEnabled?: boolean
     // end_screen properties
     message?: string
@@ -155,11 +166,17 @@ export interface Response {
   paymentStatus: 'pending' | 'completed' | 'failed' | 'none'
   paymentAmount?: number | null
   paypalOrderId?: string
+  paymentMethod?: 'paypal' | 'in_person' | null
   checkInStatus: 'not_checked_in' | 'checked_in'
   checkInAt?: { toDate: () => Date } | null
   userId?: string | null
   eventId?: string | null
   attendeeCount?: number
+  checkInAttendeeCount?: number
+  receiptNumber?: string
+  receiptVoided?: boolean
+  receiptVoidedAt?: { toDate: () => Date } | null
+  receiptVoidedNumber?: string
 }
 
 // ─── Form actions (triggered on submit) ──────────────────────────────────────
@@ -206,6 +223,22 @@ export interface WorkspaceEmailTemplates {
   submitterConfirmation?: EmailTemplate
 }
 
+// ─── Fiscal config (stored in workspace_settings) ────────────────────────────
+
+export interface FiscalConfig {
+  organizationName: string     // Ragione sociale / nome associazione
+  fiscalCode: string           // Codice fiscale o P.IVA
+  address: string              // Via, numero civico
+  city: string                 // Città
+  postalCode: string           // CAP
+  province: string             // Sigla provincia
+  phone?: string
+  email?: string
+  website?: string
+  vatNumber?: string           // Partita IVA (se diversa da CF)
+  notes?: string               // Note a piè ricevuta (es. "Ente del Terzo Settore")
+}
+
 // ─── PayPal config (stored in workspace_settings, secret never sent to client) ─
 
 export interface PaypalConfig {
@@ -237,6 +270,81 @@ export interface UserProfile {
   role: 'admin' | 'user'
 }
 
+// ─── Accounting ───────────────────────────────────────────────────────────────
+
+export type ExpenseCategory = 'venue' | 'catering' | 'marketing' | 'staff' | 'equipment' | 'other'
+
+export interface AccountingExpense {
+  id: string
+  eventId: string
+  description: string
+  invoiceNumber?: string    // numero fattura o ricevuta
+  amount: number            // importo in EUR
+  category: ExpenseCategory
+  date: string              // ISO date "2026-06-11"
+  notes?: string
+  createdAt: { toDate: () => Date } | null
+}
+
+export type ManualIncomeMethod = 'cash' | 'bank_transfer' | 'paypal' | 'stripe' | 'other'
+
+export interface ManualIncome {
+  id: string
+  eventId: string
+  description: string
+  amount: number
+  method: ManualIncomeMethod
+  date: string              // ISO date
+  notes?: string
+  createdAt: { toDate: () => Date } | null
+}
+
+// Entrata non legata a un evento (fondo cassa, contributo generale, ecc.)
+export interface WorkspaceIncome {
+  id: string
+  workspaceId: string
+  description: string
+  amount: number
+  method: ManualIncomeMethod
+  date: string              // ISO date
+  notes?: string
+  createdAt: { toDate: () => Date } | null
+}
+
+// ─── Cassa (Cash Register) ────────────────────────────────────────────────────
+
+export interface CassaItem {
+  id: string
+  label: string
+  price: number        // 0 = importo libero
+  currency: string     // 'EUR'
+  imageUrl?: string    // URL immagine/icona
+  emoji?: string       // emoji alternativa all'immagine
+  color?: string       // colore sfondo tasto (hex)
+  sortOrder?: number
+}
+
+export interface CassaTransaction {
+  id: string
+  eventId: string
+  workspaceId: string
+  items: CassaTransactionItem[]
+  total: number
+  method: ManualIncomeMethod
+  note?: string
+  operatorName?: string
+  date: string              // ISO date
+  createdAt: { toDate: () => Date } | null
+}
+
+export interface CassaTransactionItem {
+  cassaItemId: string | 'custom'
+  label: string
+  price: number
+  qty: number
+  subtotal: number
+}
+
 // ─── Events ───────────────────────────────────────────────────────────────────
 
 export type EventStatus = 'draft' | 'published' | 'closed' | 'cancelled'
@@ -264,11 +372,14 @@ export interface SolidandoEvent {
   totalCapacity: number | null   // null = illimitato
   ticketTypes: TicketType[]
   formId?: string        // form iscrizione collegato
-  attendeeFieldId?: string  // id del campo number nel form che indica il numero di persone
+  attendeeFieldId?: string   // legacy: singolo campo numero persone
+  attendeeFieldIds?: string[] // multi-campo: somma più campi numero (es. adulti + bambini)
   ctaLabel?: string      // testo bottone CTA sulla pagina pubblica
+  receiptDescription?: string  // dicitura causale nelle ricevute fiscali
   workspaceId: string
   createdBy: string
   closesAt?: string      // ISO datetime — chiusura automatica iscrizioni
+  cassaItems?: CassaItem[]  // articoli configurati per la cassa
   createdAt: { toDate: () => Date } | null
   updatedAt: { toDate: () => Date } | null
   // computed/cached

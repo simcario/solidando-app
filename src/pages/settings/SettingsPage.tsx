@@ -3,11 +3,11 @@ import AppLayout from '../../components/layout/AppLayout'
 import Icon from '../../components/ui/Icon'
 import ImageUpload from '../../components/ui/ImageUpload'
 import { useAuthStore } from '../../stores/authStore'
-import { getWorkspaceSettings, saveSmtpConfig, savePaypalConfig, saveBrandingConfig, saveEmailTemplates } from '../../firebase/workspace'
+import { getWorkspaceSettings, saveSmtpConfig, savePaypalConfig, saveBrandingConfig, saveEmailTemplates, saveFiscalConfig } from '../../firebase/workspace'
 import { showToast } from '../../components/ui/Toast'
 import { getFunctions, httpsCallable } from 'firebase/functions'
 import { app } from '../../firebase/config'
-import type { SmtpConfig, PaypalConfig, WorkspaceEmailTemplates, EmailTemplate } from '../../types/form'
+import type { SmtpConfig, PaypalConfig, WorkspaceEmailTemplates, EmailTemplate, FiscalConfig } from '../../types/form'
 import NotificationsAdminPanel from '../../components/notifications/NotificationsAdminPanel'
 
 function resolveWorkspaceId(profile: ReturnType<typeof useAuthStore.getState>['profile']): string {
@@ -42,15 +42,30 @@ const DEFAULT_EMAIL_TEMPLATES: WorkspaceEmailTemplates = {
   },
 }
 
-type Tab = 'profilo' | 'integrazioni' | 'branding' | 'notifiche' | 'avanzate'
+type Tab = 'profilo' | 'integrazioni' | 'branding' | 'fiscale' | 'notifiche' | 'avanzate'
 
 const TABS: { id: Tab; label: string; icon: string; adminOnly?: boolean }[] = [
   { id: 'profilo', label: 'Profilo', icon: 'person' },
   { id: 'integrazioni', label: 'Integrazioni', icon: 'cable' },
   { id: 'branding', label: 'Branding', icon: 'palette' },
+  { id: 'fiscale', label: 'Dati Fiscali', icon: 'receipt_long' },
   { id: 'notifiche', label: 'Notifiche', icon: 'notifications_active', adminOnly: true },
   { id: 'avanzate', label: 'Avanzate', icon: 'settings' },
 ]
+
+const DEFAULT_FISCAL: FiscalConfig = {
+  organizationName: '',
+  fiscalCode: '',
+  address: '',
+  city: '',
+  postalCode: '',
+  province: '',
+  phone: '',
+  email: '',
+  website: '',
+  vatNumber: '',
+  notes: '',
+}
 
 export default function SettingsPage() {
   const { profile } = useAuthStore()
@@ -79,6 +94,10 @@ export default function SettingsPage() {
   const [primaryColor, setPrimaryColor] = useState('#002068')
   const [savingBranding, setSavingBranding] = useState(false)
 
+  // Fiscal state
+  const [fiscal, setFiscal] = useState<FiscalConfig>(DEFAULT_FISCAL)
+  const [savingFiscal, setSavingFiscal] = useState(false)
+
   useEffect(() => {
     if (!profile) return
     if (!workspaceId) {
@@ -98,6 +117,7 @@ export default function SettingsPage() {
           submitterConfirmation: ws.emailTemplates?.submitterConfirmation ?? t.submitterConfirmation,
         }))
       }
+      if (ws.fiscal) setFiscal({ ...DEFAULT_FISCAL, ...ws.fiscal })
       setLoadingSmtp(false)
     })
   }, [workspaceId, profile])
@@ -198,6 +218,23 @@ export default function SettingsPage() {
     } finally {
       setSavingBranding(false)
     }
+  }
+
+  async function handleSaveFiscal() {
+    if (!workspaceId) return
+    setSavingFiscal(true)
+    try {
+      await saveFiscalConfig(workspaceId, fiscal)
+      showToast('Dati fiscali salvati', 'success')
+    } catch {
+      showToast('Errore nel salvataggio dati fiscali', 'error')
+    } finally {
+      setSavingFiscal(false)
+    }
+  }
+
+  function patchFiscal(patch: Partial<FiscalConfig>) {
+    setFiscal(f => ({ ...f, ...patch }))
   }
 
   const visibleTabs = TABS.filter(t => !t.adminOnly || profile?.role === 'admin')
@@ -567,6 +604,142 @@ export default function SettingsPage() {
               </div>
             </section>
 
+          </div>
+        )}
+
+        {/* ── DATI FISCALI ── */}
+        {activeTab === 'fiscale' && (
+          <div className="space-y-6">
+            {/* Banner informativo */}
+            <div className="flex items-start gap-3 p-4 bg-[#fff3e0] border border-[#fe9832] rounded-xl">
+              <Icon name="info" size={20} className="text-[#fe9832] shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-bold text-[#683700]">Dati richiesti per le ricevute fiscali</p>
+                <p className="text-xs text-[#8f5a00] mt-0.5">
+                  Questi dati compaiono su ogni ricevuta inviata agli utenti. Compila tutti i campi obbligatori per abilitare l'invio automatico delle ricevute.
+                </p>
+              </div>
+            </div>
+
+            <section className="bg-white rounded-xl border border-[#c4c5d5] p-6">
+              <h2 className="text-lg font-bold text-[#1a1b22] mb-1 flex items-center gap-2">
+                <Icon name="account_balance" size={20} className="text-[#002068]" />
+                Dati dell'Organizzazione
+              </h2>
+              <p className="text-sm text-[#747684] mb-5">
+                Ragione sociale, codice fiscale e indirizzo che appariranno sulle ricevute.
+              </p>
+
+              {loadingSmtp ? (
+                <div className="flex items-center gap-2 text-sm text-[#747684]">
+                  <div className="w-4 h-4 border-2 border-[#002068] border-t-transparent rounded-full animate-spin" />
+                  Caricamento configurazione...
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <label className={labelCls}>Ragione sociale / Nome associazione <span className="text-[#ba1a1a]">*</span></label>
+                    <input value={fiscal.organizationName} onChange={e => patchFiscal({ organizationName: e.target.value })} placeholder="Associazione Culturale Esempio APS" className={inputCls} />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className={labelCls}>Codice Fiscale <span className="text-[#ba1a1a]">*</span></label>
+                      <input value={fiscal.fiscalCode} onChange={e => patchFiscal({ fiscalCode: e.target.value.toUpperCase() })} placeholder="ABCDEF12G34H567I" className={`${inputCls} font-mono uppercase`} maxLength={16} />
+                    </div>
+                    <div className="space-y-1">
+                      <label className={labelCls}>Partita IVA (se diversa da CF)</label>
+                      <input value={fiscal.vatNumber ?? ''} onChange={e => patchFiscal({ vatNumber: e.target.value })} placeholder="IT12345678901" className={`${inputCls} font-mono`} />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className={labelCls}>Indirizzo <span className="text-[#ba1a1a]">*</span></label>
+                    <input value={fiscal.address} onChange={e => patchFiscal({ address: e.target.value })} placeholder="Via Roma, 1" className={inputCls} />
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="col-span-2 space-y-1">
+                      <label className={labelCls}>Città <span className="text-[#ba1a1a]">*</span></label>
+                      <input value={fiscal.city} onChange={e => patchFiscal({ city: e.target.value })} placeholder="Milano" className={inputCls} />
+                    </div>
+                    <div className="space-y-1">
+                      <label className={labelCls}>CAP <span className="text-[#ba1a1a]">*</span></label>
+                      <input value={fiscal.postalCode} onChange={e => patchFiscal({ postalCode: e.target.value })} placeholder="20100" className={inputCls} maxLength={5} />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className={labelCls}>Provincia <span className="text-[#ba1a1a]">*</span></label>
+                    <input value={fiscal.province} onChange={e => patchFiscal({ province: e.target.value.toUpperCase() })} placeholder="MI" className={`${inputCls} w-24 uppercase`} maxLength={2} />
+                  </div>
+
+                  <hr className="border-[#e8e7f0]" />
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className={labelCls}>Telefono</label>
+                      <input value={fiscal.phone ?? ''} onChange={e => patchFiscal({ phone: e.target.value })} placeholder="+39 02 1234567" className={inputCls} />
+                    </div>
+                    <div className="space-y-1">
+                      <label className={labelCls}>Email</label>
+                      <input type="email" value={fiscal.email ?? ''} onChange={e => patchFiscal({ email: e.target.value })} placeholder="info@esempio.it" className={inputCls} />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className={labelCls}>Sito web</label>
+                    <input value={fiscal.website ?? ''} onChange={e => patchFiscal({ website: e.target.value })} placeholder="https://www.esempio.it" className={inputCls} />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className={labelCls}>Note a piè ricevuta</label>
+                    <textarea
+                      value={fiscal.notes ?? ''}
+                      onChange={e => patchFiscal({ notes: e.target.value })}
+                      rows={3}
+                      placeholder="Es: Ente del Terzo Settore iscr. RUNTS. La presente ricevuta non è soggetta ad IVA ai sensi dell'art. 4 DPR 633/72."
+                      className="w-full px-4 py-3 bg-[#f4f3fc] border border-[#c4c5d5] rounded-lg text-sm focus:ring-2 focus:ring-[#002068] focus:outline-none resize-y"
+                    />
+                  </div>
+
+                  {/* Stato completezza */}
+                  {(() => {
+                    const required = ['organizationName', 'fiscalCode', 'address', 'city', 'postalCode', 'province'] as const
+                    const missing = required.filter(k => !fiscal[k]?.trim())
+                    if (missing.length > 0) {
+                      return (
+                        <div className="flex items-center gap-2 p-3 bg-[#ffdad6] rounded-lg text-sm text-[#ba1a1a] font-medium">
+                          <Icon name="warning" size={16} />
+                          Mancano {missing.length} campo/i obbligatori — le ricevute non saranno inviate finché non completi tutti i dati.
+                        </div>
+                      )
+                    }
+                    return (
+                      <div className="flex items-center gap-2 p-3 bg-[#d4edda] rounded-lg text-sm text-[#1a6b3a] font-medium">
+                        <Icon name="check_circle" size={16} />
+                        Dati completi — le ricevute fiscali possono essere inviate.
+                      </div>
+                    )
+                  })()}
+
+                  <div className="pt-2">
+                    <button
+                      onClick={handleSaveFiscal}
+                      disabled={savingFiscal}
+                      className="flex items-center gap-2 px-5 py-2.5 bg-[#002068] text-white rounded-lg text-sm font-bold hover:bg-[#003399] transition-colors disabled:opacity-60"
+                    >
+                      {savingFiscal ? (
+                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      ) : (
+                        <Icon name="save" size={16} />
+                      )}
+                      {savingFiscal ? 'Salvataggio...' : 'Salva dati fiscali'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
           </div>
         )}
 

@@ -8,7 +8,7 @@ import CoverInspector from './CoverInspector'
 import EndScreenInspector from './EndScreenInspector'
 import VariablesPanel from './VariablesPanel'
 import ActionsPanel from './ActionsPanel'
-import type { FormulaOp } from '../../../types/form'
+import type { FormulaOp, PaymentFormulaTerm, PaymentFormulaConfig } from '../../../types/form'
 
 // ─── Inspector panel ────────────────────────────────────────────────────────
 
@@ -633,20 +633,44 @@ const OP_LABELS: Record<FormulaOp, string> = { '*': '×', '+': '+', '-': '−', 
 
 function PaymentEditor({ node }: { node: ReturnType<typeof useBuilderStore.getState>['nodes'][0] }) {
   const { nodes, variables, updateNode } = useBuilderStore()
-  const formula = node.properties.paymentFormula
+  const rawFormula = node.properties.paymentFormula
   const currency = node.properties.currency ?? 'EUR'
   const payInPersonEnabled = node.properties.payInPersonEnabled ?? false
 
   const numericNodes = nodes.filter(n => n.id !== node.id && n.type === 'number')
 
-  function setFormula(patch: Partial<NonNullable<typeof formula>>) {
-    const base = formula ?? { fieldId: '', op: '*' as FormulaOp, variableId: '' }
-    updateNode(node.id, { properties: { ...node.properties, paymentFormula: { ...base, ...patch } } })
+  // normalise legacy FormulaConfig → PaymentFormulaConfig
+  const multiFormula: PaymentFormulaConfig | null = rawFormula
+    ? 'terms' in rawFormula
+      ? rawFormula as PaymentFormulaConfig
+      : { terms: [{ fieldId: rawFormula.fieldId, op: rawFormula.op, variableId: rawFormula.variableId }], combineOp: '+' }
+    : null
+
+  function saveMultiFormula(pf: PaymentFormulaConfig) {
+    updateNode(node.id, { properties: { ...node.properties, paymentFormula: pf } })
   }
 
   function clearFormula() {
     const { paymentFormula: _pf, ...rest } = node.properties
     updateNode(node.id, { properties: rest })
+  }
+
+  function addTerm() {
+    const base: PaymentFormulaConfig = multiFormula ?? { terms: [], combineOp: '+' }
+    saveMultiFormula({ ...base, terms: [...base.terms, { fieldId: numericNodes[0]?.id ?? '', op: '*', variableId: variables[0]?.id ?? '' }] })
+  }
+
+  function updateTerm(idx: number, patch: Partial<PaymentFormulaTerm>) {
+    if (!multiFormula) return
+    const terms = multiFormula.terms.map((t, i) => i === idx ? { ...t, ...patch } : t)
+    saveMultiFormula({ ...multiFormula, terms })
+  }
+
+  function removeTerm(idx: number) {
+    if (!multiFormula) return
+    const terms = multiFormula.terms.filter((_, i) => i !== idx)
+    if (terms.length === 0) { clearFormula(); return }
+    saveMultiFormula({ ...multiFormula, terms })
   }
 
   return (
@@ -684,84 +708,113 @@ function PaymentEditor({ node }: { node: ReturnType<typeof useBuilderStore.getSt
         </div>
       </div>
 
-      {/* Formula importo */}
+      {/* Formula importo multi-termine */}
       <div className="p-4 bg-[#f4f3fc] rounded-xl space-y-3 border border-[#c4c5d5]">
         <h4 className="text-xs font-bold text-[#002068] uppercase tracking-wider flex items-center gap-1.5">
           <Icon name="calculate" size={15} />
           Formula importo
         </h4>
-        <p className="text-[10px] text-[#747684]">Calcola l'importo da un campo × variabile. Sovrascrive l'importo fisso.</p>
-        {!formula ? (
-          <button
-            onClick={() => setFormula({ fieldId: numericNodes[0]?.id ?? '', op: '*', variableId: variables[0]?.id ?? '' })}
-            className="w-full py-2 border border-dashed border-[#c4c5d5] bg-white rounded-lg text-sm text-[#444653] hover:border-[#002068] hover:text-[#002068] transition-colors flex items-center justify-center gap-1.5"
-          >
-            <Icon name="add" size={16} /> Aggiungi formula
-          </button>
-        ) : (
-          <div className="space-y-2">
-            <div className="space-y-1">
-              <label className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Campo numero</label>
-              <select
-                value={formula.fieldId}
-                onChange={e => setFormula({ fieldId: e.target.value })}
-                className="w-full h-9 px-2 bg-white border border-[#c4c5d5] rounded-lg text-sm focus:ring-1 focus:ring-[#002068] focus:outline-none"
+        <p className="text-[10px] text-[#747684]">
+          Ogni termine è <strong>campo × variabile</strong>. I termini vengono sommati tra loro. Sovrascrive l'importo fisso.
+        </p>
+
+        {multiFormula && multiFormula.terms.length > 1 && (
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Combina termini con</span>
+            {(['+', '-'] as const).map(op => (
+              <button
+                key={op}
+                onClick={() => saveMultiFormula({ ...multiFormula, combineOp: op })}
+                className={`w-9 h-7 rounded-lg text-sm font-bold border transition-all ${
+                  multiFormula.combineOp === op
+                    ? 'bg-[#002068] text-white border-[#002068]'
+                    : 'bg-white text-[#444653] border-[#c4c5d5] hover:border-[#002068]'
+                }`}
               >
-                <option value="">— seleziona campo —</option>
-                {numericNodes.map(n => (
-                  <option key={n.id} value={n.id}>{n.properties.label || n.id}</option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <label className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Operazione</label>
-              <div className="flex gap-1">
-                {(['*', '+', '-', '/'] as FormulaOp[]).map(op => (
-                  <button
-                    key={op}
-                    onClick={() => setFormula({ op })}
-                    className={`flex-1 h-9 rounded-lg text-sm font-bold border transition-all ${
-                      formula.op === op
-                        ? 'bg-[#002068] text-white border-[#002068]'
-                        : 'bg-white text-[#444653] border-[#c4c5d5] hover:border-[#002068]'
-                    }`}
-                  >
-                    {OP_LABELS[op]}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="space-y-1">
-              <label className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Variabile</label>
-              <select
-                value={formula.variableId}
-                onChange={e => setFormula({ variableId: e.target.value })}
-                className="w-full h-9 px-2 bg-white border border-[#c4c5d5] rounded-lg text-sm focus:ring-1 focus:ring-[#002068] focus:outline-none"
-              >
-                <option value="">— seleziona variabile —</option>
-                {variables.map(v => (
-                  <option key={v.id} value={v.id}>{v.name} = {v.value}{v.unit ? ` ${v.unit}` : ''}</option>
-                ))}
-              </select>
-            </div>
-            {formula.fieldId && formula.variableId && (() => {
-              const srcNode = nodes.find(n => n.id === formula.fieldId)
-              const variable = variables.find(v => v.id === formula.variableId)
-              if (!srcNode || !variable) return null
-              return (
-                <div className="bg-white border border-[#b5c4ff] rounded-lg px-3 py-2 text-xs text-[#002068] font-mono">
-                  {srcNode.properties.label || 'campo'} {OP_LABELS[formula.op]} {variable.name}({variable.value})
-                  {variable.unit ? ` ${variable.unit}` : ''}
-                </div>
-              )
-            })()}
-            <button
-              onClick={clearFormula}
-              className="text-xs text-[#747684] hover:text-[#ba1a1a] flex items-center gap-1 transition-colors"
-            >
-              <Icon name="close" size={14} /> Rimuovi formula
-            </button>
+                {op === '+' ? '+' : '−'}
+              </button>
+            ))}
           </div>
+        )}
+
+        {multiFormula && multiFormula.terms.map((term, idx) => {
+          const srcNode = nodes.find(n => n.id === term.fieldId)
+          const variable = variables.find(v => v.id === term.variableId)
+          return (
+            <div key={idx} className="bg-white border border-[#c4c5d5] rounded-xl p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold text-[#002068] uppercase tracking-wider">Termine {idx + 1}</span>
+                <button onClick={() => removeTerm(idx)} className="text-[#747684] hover:text-[#ba1a1a] transition-colors">
+                  <Icon name="close" size={14} />
+                </button>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Campo numero</label>
+                <select
+                  value={term.fieldId}
+                  onChange={e => updateTerm(idx, { fieldId: e.target.value })}
+                  className="w-full h-9 px-2 bg-[#f4f3fc] border border-[#c4c5d5] rounded-lg text-sm focus:ring-1 focus:ring-[#002068] focus:outline-none"
+                >
+                  <option value="">— seleziona campo —</option>
+                  {numericNodes.map(n => (
+                    <option key={n.id} value={n.id}>{n.properties.label || n.id}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Operazione</label>
+                <div className="flex gap-1">
+                  {(['*', '+', '-', '/'] as FormulaOp[]).map(op => (
+                    <button
+                      key={op}
+                      onClick={() => updateTerm(idx, { op })}
+                      className={`flex-1 h-8 rounded-lg text-sm font-bold border transition-all ${
+                        term.op === op
+                          ? 'bg-[#002068] text-white border-[#002068]'
+                          : 'bg-white text-[#444653] border-[#c4c5d5] hover:border-[#002068]'
+                      }`}
+                    >
+                      {OP_LABELS[op]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-[#747684] uppercase tracking-wider">Variabile</label>
+                <select
+                  value={term.variableId}
+                  onChange={e => updateTerm(idx, { variableId: e.target.value })}
+                  className="w-full h-9 px-2 bg-[#f4f3fc] border border-[#c4c5d5] rounded-lg text-sm focus:ring-1 focus:ring-[#002068] focus:outline-none"
+                >
+                  <option value="">— seleziona variabile —</option>
+                  {variables.map(v => (
+                    <option key={v.id} value={v.id}>{v.name} = {v.value}{v.unit ? ` ${v.unit}` : ''}</option>
+                  ))}
+                </select>
+              </div>
+              {term.fieldId && term.variableId && srcNode && variable && (
+                <div className="bg-[#f4f3fc] border border-[#b5c4ff] rounded-lg px-3 py-1.5 text-xs text-[#002068] font-mono">
+                  {srcNode.properties.label || 'campo'} {OP_LABELS[term.op]} {variable.name}({variable.value}){variable.unit ? ` ${variable.unit}` : ''}
+                </div>
+              )}
+            </div>
+          )
+        })}
+
+        <button
+          onClick={addTerm}
+          className="w-full py-2 border border-dashed border-[#c4c5d5] bg-white rounded-lg text-sm text-[#444653] hover:border-[#002068] hover:text-[#002068] transition-colors flex items-center justify-center gap-1.5"
+        >
+          <Icon name="add" size={16} /> {multiFormula ? 'Aggiungi termine' : 'Aggiungi formula'}
+        </button>
+
+        {multiFormula && (
+          <button
+            onClick={clearFormula}
+            className="text-xs text-[#747684] hover:text-[#ba1a1a] flex items-center gap-1 transition-colors"
+          >
+            <Icon name="close" size={14} /> Rimuovi formula
+          </button>
         )}
       </div>
 

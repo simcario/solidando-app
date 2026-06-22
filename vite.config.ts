@@ -3,12 +3,17 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
+const buildTime = new Date().toISOString()
+
 export default defineConfig({
+  define: {
+    __BUILD_TIME__: JSON.stringify(buildTime),
+  },
   plugins: [
     react(),
     tailwindcss(),
     VitePWA({
-      registerType: 'autoUpdate',
+      registerType: 'prompt',
       injectRegister: 'auto',
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,webp,woff2}'],
@@ -37,7 +42,7 @@ export default defineConfig({
         theme_color: '#002068',
         background_color: '#faf8ff',
         display: 'standalone',
-        orientation: 'portrait',
+        orientation: 'any',
         start_url: '/my',
         scope: '/',
         icons: [
